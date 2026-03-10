@@ -1,0 +1,17 @@
+3-WAY BENCHMARK RESULTS (2026-02-28)
+=====================================
+cosmocnc (NumPy CPU) vs cosmocnc_jax (JAX CPU) vs cosmocnc_jax (JAX GPU)
+
+Config: n_z=100, n_points=16384, n_points_data_lik=2048, 10 evals (avg of last 8)
+GPU: NVIDIA RTX PRO 6000 Blackwell (96GB)
+CPU: 10 cores via taskset
+
+                         NumPy CPU     JAX CPU   CPU speedup     JAX GPU   GPU speedup
+update_params              1.178s       0.006s        196x        0.005s        226x
+get_log_lik               15.765s       0.553s       28.5x        0.033s        473x
+TOTAL per eval            16.943s       0.559s        30x         0.039s        439x
+
+Numerical accuracy (log_lik vs NumPy):
+  JAX CPU: max_rel = 4.47e-05
+  JAX GPU: max_rel = 4.47e-05
+  CPU vs GPU: max_rel = 2.6e-14

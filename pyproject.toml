@@ -1,0 +1,43 @@
+[project]
+name = "cosmocnc_jax"
+version = "1.0"
+description = "JAX-accelerated Python package for fast cluster number count likelihood computation"
+authors = [
+    { name = "Inigo Zubeldia", email = "inigo.zubeldia@ast.cam.ac.uk" },
+    { name = "Boris Bolliet" },
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "jax",
+    "jaxlib",
+]
+
+[project.optional-dependencies]
+cobaya = [
+    "cobaya (>=3.5)",
+]
+emulator = [
+    "tensorflow",
+]
+mcfit = [
+    "mcfit",
+]
+
+[project.urls]
+Homepage = "https://github.com/inigozubeldia/cosmocnc"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cosmocnc_jax"]
+
+[tool.setuptools.package-data]
+cosmocnc_jax = ["data/**/*", "surveys/**/*"]
