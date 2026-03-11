@@ -244,6 +244,131 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
     return backward_conv_nd
 
 
+def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
+                        pref_fns, n_psr_list, n_pts):
+    """Factory: forward pass for 2D backward conv (separate JIT stage A).
+
+    Computes per-cluster: lnM grid → prefactors → layer-0 → layer-1 → residuals.
+    Returns arrays consumed by the 2D conv core (stage B).
+    """
+
+    def per_cluster(mn, mx, obs_vals,
+                    E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                    H0, D_CMB, gamma,
+                    all_pref_sr, all_layer0_sr, all_layer1_sr):
+        lnM = jnp.linspace(mn, mx, n_pts)
+
+        x_l0_list = []
+        x_l0_lin_list = []
+        x_l1_residuals = []
+
+        for j in range(2):
+            prefactors = pref_fns[j](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                                     H0, D_CMB, gamma, *all_pref_sr[j])
+            layer0_args = prefactors + all_layer0_sr[j]
+
+            if layer0_returns_aux_list[j]:
+                x_l0_j, _ = layer0_fns[j](lnM, *layer0_args)
+            else:
+                x_l0_j = layer0_fns[j](lnM, *layer0_args)
+
+            x_l0_list.append(x_l0_j)
+            x_l0_lin = jnp.linspace(x_l0_j[0], x_l0_j[-1], n_pts)
+            x_l0_lin_list.append(x_l0_lin)
+
+            if len(all_layer1_sr[j]) > 0:
+                x_l1_j = layer1_fns[j](x_l0_lin, *all_layer1_sr[j])
+            else:
+                x_l1_j = layer1_fns[j](x_l0_lin)
+
+            x_l1_residuals.append(x_l1_j - obs_vals[j])
+
+        # Pack outputs: residuals, kernel coords, interp coords, grid info
+        r0 = x_l1_residuals[0]
+        r1 = x_l1_residuals[1]
+        kc0 = x_l0_lin_list[0] - jnp.mean(x_l0_lin_list[0]) + 0.5 * (x_l0_lin_list[0][1] - x_l0_lin_list[0][0])
+        kc1 = x_l0_lin_list[1] - jnp.mean(x_l0_lin_list[1]) + 0.5 * (x_l0_lin_list[1][1] - x_l0_lin_list[1][0])
+        x_l0_0 = x_l0_list[0]
+        x_l0_1 = x_l0_list[1]
+        x_lin_0_start = x_l0_lin_list[0][0]
+        x_lin_1_start = x_l0_lin_list[1][0]
+        dx0 = x_l0_lin_list[0][1] - x_l0_lin_list[0][0]
+        dx1 = x_l0_lin_list[1][1] - x_l0_lin_list[1][0]
+
+        return r0, r1, kc0, kc1, x_l0_0, x_l0_1, x_lin_0_start, x_lin_1_start, dx0, dx1
+
+    vmap_in = (
+        0, 0,               # mn, mx
+        0,                  # obs_vals (batch, 2)
+        0, 0, 0, 0,        # cosmo per-cluster
+        None, None, None,   # cosmo scalars
+        tuple([tuple([None]*n) for n in n_psr_list]),  # all_pref_sr
+        tuple([None]*2),    # all_layer0_sr
+        tuple([None]*2),    # all_layer1_sr
+    )
+
+    return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
+
+
+def build_2d_conv_fn(n_pts):
+    """Factory: pure-math 2D conv core (separate JIT stage B).
+
+    Takes pre-computed arrays from the forward pass. No SR functions inside —
+    prevents XLA from fusing with the forward pass, avoiding shared memory
+    overflow on Blackwell GPUs (128×128×8 = 128KB > 101KB limit).
+    """
+
+    def per_cluster(r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                    x_lin_0_start, x_lin_1_start, dx0, dx1,
+                    obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
+                    has_scatter, apply_cutoff, cutoff_val):
+        # Layer-1 Gaussian (outer product — no meshgrid)
+        maha1 = (inv_cov1[0, 0] * r0[:, None]**2 +
+                 inv_cov1[1, 1] * r1[None, :]**2 +
+                 2. * inv_cov1[0, 1] * r0[:, None] * r1[None, :])
+        cpdf = norm1 * jnp.exp(-0.5 * maha1)
+
+        # Observable cutoff
+        raw1 = r0 + obs_val_0
+        cpdf = jnp.where(apply_cutoff & (raw1[:, None] < cutoff_val), 0., cpdf)
+
+        # Layer-0 kernel (outer product)
+        maha0 = (inv_cov0[0, 0] * kc0[:, None]**2 +
+                 inv_cov0[1, 1] * kc1[None, :]**2 +
+                 2. * inv_cov0[0, 1] * kc0[:, None] * kc1[None, :])
+        kernel = norm0 * jnp.exp(-0.5 * maha0)
+
+        # Circular convolution
+        cpdf_conv = convolve_nd(cpdf, kernel)
+        cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
+        cpdf = jnp.maximum(cpdf, 0.)
+
+        # Bilinear interpolation at diagonal points
+        n_p = n_pts
+        fi0 = jnp.clip((x_l0_0 - x_lin_0_start) / dx0, 0., n_p - 1 - 1e-7)
+        fi1 = jnp.clip((x_l0_1 - x_lin_1_start) / dx1, 0., n_p - 1 - 1e-7)
+        i0 = jnp.clip(jnp.floor(fi0).astype(jnp.int32), 0, n_p - 2)
+        i1 = jnp.clip(jnp.floor(fi1).astype(jnp.int32), 0, n_p - 2)
+        t0 = fi0 - i0; t1 = fi1 - i1
+        cpdf = (cpdf[i0, i1] * (1 - t0) * (1 - t1) +
+                cpdf[i0, i1 + 1] * (1 - t0) * t1 +
+                cpdf[i0 + 1, i1] * t0 * (1 - t1) +
+                cpdf[i0 + 1, i1 + 1] * t0 * t1)
+
+        return cpdf
+
+    vmap_in = (
+        0, 0, 0, 0, 0, 0,  # r0, r1, kc0, kc1, x_l0_0, x_l0_1
+        0, 0, 0, 0,        # x_lin_0_start, x_lin_1_start, dx0, dx1
+        0,                  # obs_val_0 (per-cluster for cutoff)
+        None, None,         # inv_cov1, norm1
+        None, None,         # inv_cov0, norm0
+        None, None, None,   # has_scatter, apply_cutoff, cutoff_val
+    )
+
+    return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
+
+
 def build_backward_conv_1d(layer0_fn, layer1_fn, layer0_returns_aux=False):
     """Factory: build a generic 1D 2-layer backward conv function.
 
@@ -749,21 +874,53 @@ class cluster_number_counts:
             flat_pref_fn_list.append(sr.get_prefactor_fn_unified())
             flat_n_psr_list.append(sr.get_n_prefactor_sr_params())
 
-        # ── 4b. All-in-one backward conv + combine + integrate JIT ──
+        # ── 4b. Split-JIT: build separate 2D core JITs for 2D+ correlation sets ──
+        # This prevents XLA from over-fusing the 2D FFT conv with surrounding ops
+        # (which causes shared memory overflow on Blackwell GPUs).
         padding_frac = self.cnc_params.get("padding_fraction", 0.)
         n_drop_int = int(padding_frac * n_points_dl) if padding_frac > 1e-5 else 0
         n_obs_bc = len(self._bc_obs_list)
         n_sets = len(set_bc_fns)
 
+        # Determine which sets are N-D (2+) and build separate JITs for them.
+        # Two-stage split: forward pass JIT (stage A) + conv core JIT (stage B).
+        # Prevents XLA from fusing forward pass with 2D FFT conv, which causes
+        # shared memory overflow (128×128×8 = 128KB > 101KB on Blackwell GPUs).
+        s_is_nd = []
+        self._2d_forward_jits = {}  # s_idx → jit(vmap(forward_pass))
+        self._2d_conv_jits = {}    # s_idx → jit(vmap(conv_core))
+        self._2d_core_obs_indices = {}  # s_idx → indices into _bc_obs_list
+
+        for s_idx, obs_names in enumerate(self._bc_set_obs):
+            if len(obs_names) >= 2:
+                s_is_nd.append(True)
+                l0_fns = [self.scaling_relations[o].get_layer_fn(0) for o in obs_names]
+                l1_fns = [self.scaling_relations[o].get_layer_fn(1) for o in obs_names]
+                l0_aux = [self.scaling_relations[o].get_layer_returns_aux(0) for o in obs_names]
+                p_fns = [self.scaling_relations[o].get_prefactor_fn_unified() for o in obs_names]
+                p_nsr = [self.scaling_relations[o].get_n_prefactor_sr_params() for o in obs_names]
+                self._2d_forward_jits[s_idx] = build_2d_forward_fn(
+                    l0_fns, l1_fns, l0_aux, p_fns, p_nsr, n_points_dl)
+                self._2d_conv_jits[s_idx] = build_2d_conv_fn(n_points_dl)
+                self._2d_core_obs_indices[s_idx] = [
+                    self._bc_obs_list.index(o) for o in obs_names]
+            else:
+                s_is_nd.append(False)
+
+        # ── 4c. All-in-one backward conv + combine + integrate JIT ──
+        # For 2D+ sets, uses pre-computed cpdf from split JIT (passed as input).
+        # For 1D sets, computes backward conv inline.
         def _make_allinone_bc(s_bc_fns, s_pref_fns, s_n_psr, s_sizes, s_obs_idx,
-                               f_pref_fns, f_n_psr, n_pts, n_o, n_s, n_drop):
+                               f_pref_fns, f_n_psr, n_pts, n_o, n_s, n_drop,
+                               s_is_nd_flags):
             def per_cluster(mn, mx, obs_vals, has_obs_vals, hz, skyfrac,
                             E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
                             H0, D_CMB, gamma,
                             all_pref_sr, all_layer0_sr, all_layer1_sr,
                             all_cov_layer0, all_cov_layer1,
                             all_apply_cut, all_cut_val,
-                            lnM0_min, lnM0_max, n_lnM0):
+                            lnM0_min, lnM0_max, n_lnM0,
+                            pre_nd_cpdfs):
                 # Shared: lnM grid and HMF interp (computed once)
                 lnM = jnp.linspace(mn, mx, n_pts)
                 hmf = interp_uniform(lnM, lnM0_min, lnM0_max, n_lnM0, hz,
@@ -779,26 +936,29 @@ class cluster_number_counts:
                     for k in range(n_obs_s):
                         any_has = any_has | has_obs_vals[idx[k]]
 
-                    # Compute prefactors and build args for each obs in set
-                    set_layer0_args = []
-                    set_layer1_args = []
-                    set_obs = []
-                    for k in range(n_obs_s):
-                        i = idx[k]
-                        prefactors = f_pref_fns[i](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                                                    H0, D_CMB, gamma, *all_pref_sr[i])
-                        set_layer0_args.append(prefactors + all_layer0_sr[i])
-                        set_layer1_args.append(all_layer1_sr[i])
-                        set_obs.append(obs_vals[idx[k]])
+                    if s_is_nd_flags[s]:
+                        # 2D+ set: use pre-computed cpdf from split JIT
+                        cpdf = pre_nd_cpdfs[s]
+                    else:
+                        # 1D set: compute prefactors + backward conv inline
+                        set_layer0_args = []
+                        set_layer1_args = []
+                        set_obs = []
+                        for k in range(n_obs_s):
+                            i = idx[k]
+                            prefactors = f_pref_fns[i](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                                                        H0, D_CMB, gamma, *all_pref_sr[i])
+                            set_layer0_args.append(prefactors + all_layer0_sr[i])
+                            set_layer1_args.append(all_layer1_sr[i])
+                            set_obs.append(obs_vals[idx[k]])
 
-                    set_obs_arr = jnp.array(set_obs)
+                        set_obs_arr = jnp.array(set_obs)
 
-                    # Call N-D backward conv for this correlation set
-                    cpdf = s_bc_fns[s](
-                        lnM, set_obs_arr,
-                        tuple(set_layer0_args), tuple(set_layer1_args),
-                        all_cov_layer0[s], all_cov_layer1[s],
-                        n_pts, all_apply_cut[s], all_cut_val[s])
+                        cpdf = s_bc_fns[s](
+                            lnM, set_obs_arr,
+                            tuple(set_layer0_args), tuple(set_layer1_args),
+                            all_cov_layer0[s], all_cov_layer1[s],
+                            n_pts, all_apply_cut[s], all_cut_val[s])
 
                     cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
 
@@ -825,13 +985,14 @@ class cluster_number_counts:
                 tuple([None]*n_s),  # all_apply_cut (per-set)
                 tuple([None]*n_s),  # all_cut_val (per-set)
                 None, None, None,   # lnM0_min, lnM0_max, n_lnM0
+                tuple([0]*n_s),     # pre_nd_cpdfs: all vmapped on axis 0
             )
             return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in)), per_cluster
 
         self._allinone_bc_jit, self._allinone_bc_per_cluster = _make_allinone_bc(
             set_bc_fns, set_pref_fns, set_n_psr, set_sizes, set_obs_indices,
             flat_pref_fn_list, flat_n_psr_list, n_points_dl,
-            n_obs_bc, n_sets, n_drop_int)
+            n_obs_bc, n_sets, n_drop_int, s_is_nd)
 
         # ── 4c. Merged mass_range with prefactors JIT ──
         mass_range_fn_inner = self._mass_range_fn
@@ -1646,21 +1807,90 @@ class cluster_number_counts:
             all_cut_val_sets = tuple(all_cut_val_sets)
 
             bc_chunk = int(self.cnc_params.get("bc_chunk_size", 0))
+            n_points_dl = int(self.cnc_params["n_points_data_lik"])
 
-            # Shared (non-per-cluster) args
+            # Shared (non-per-cluster) args for all-in-one
             shared_args = (H0_jnp, D_CMB_jnp, gamma_jnp,
                            all_pref_sr, all_layer0_sr, all_layer1_sr,
                            all_cov_layer0, all_cov_layer1,
                            all_apply_cut_sets, all_cut_val_sets,
                            lnM0_min, lnM0_max, n_lnM0)
 
+            # ── Split-JIT: compute 2D+ core cpdfs in separate JITs ──
+            # Two stages per 2D set to prevent XLA over-fusion:
+            #   Stage A: forward pass (prefactors + layer-0 + layer-1 → arrays)
+            #   Stage B: 2D conv core (outer-product Gaussian + circular conv + bilinear interp)
+            def _compute_2d_cores(sl=None):
+                """Compute pre_nd_cpdfs for all sets. 2D+ sets use split JIT,
+                1D sets get dummy arrays (never used by all-in-one)."""
+                pre_nd_list = []
+                n_cl = n_bc if sl is None else sl.stop - sl.start
+                for s_idx in range(len(self._bc_set_obs)):
+                    if s_idx in self._2d_forward_jits:
+                        idx_list = self._2d_core_obs_indices[s_idx]
+                        # obs_vals for this 2D set: (n_bc, 2)
+                        set_obs = jnp.stack(
+                            [all_obs_vals[i, sl] if sl else all_obs_vals[i]
+                             for i in idx_list], axis=1)
+                        set_pref_sr = tuple(all_pref_sr[i] for i in idx_list)
+                        set_layer0_sr = tuple(all_layer0_sr[i] for i in idx_list)
+                        set_layer1_sr = tuple(all_layer1_sr[i] for i in idx_list)
+
+                        mn = lnM_min[sl] if sl else lnM_min
+                        mx = lnM_max[sl] if sl else lnM_max
+                        ez = E_z_c[sl] if sl else E_z_c
+                        da = D_A_c[sl] if sl else D_A_c
+                        dl = D_l_CMB_c[sl] if sl else D_l_CMB_c
+                        rc = rho_c_c[sl] if sl else rho_c_c
+
+                        # Stage A: forward pass
+                        (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                         x_lin_0_start, x_lin_1_start,
+                         dx0_arr, dx1_arr) = self._2d_forward_jits[s_idx](
+                            mn, mx, set_obs,
+                            ez, da, dl, rc,
+                            H0_jnp, D_CMB_jnp, gamma_jnp,
+                            set_pref_sr, set_layer0_sr, set_layer1_sr)
+
+                        # Pre-compute covariance inverse and normalization
+                        cov1 = all_cov_layer0[s_idx]  # wait, layer indices
+                        cov_l1 = all_cov_layer1[s_idx]
+                        cov_l0 = all_cov_layer0[s_idx]
+                        det1 = cov_l1[0, 0] * cov_l1[1, 1] - cov_l1[0, 1]**2
+                        inv_cov1 = jnp.array([[cov_l1[1, 1], -cov_l1[0, 1]],
+                                               [-cov_l1[0, 1], cov_l1[0, 0]]]) / det1
+                        norm1 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det1)
+
+                        det0 = cov_l0[0, 0] * cov_l0[1, 1] - cov_l0[0, 1]**2
+                        inv_cov0 = jnp.array([[cov_l0[1, 1], -cov_l0[0, 1]],
+                                               [-cov_l0[0, 1], cov_l0[0, 0]]]) / det0
+                        norm0 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det0)
+                        has_scatter = ~jnp.all(cov_l0 == 0.)
+
+                        # obs_val_0 per cluster (for cutoff)
+                        obs_val_0 = set_obs[:, 0]
+
+                        # Stage B: 2D conv core
+                        cpdf_2d = self._2d_conv_jits[s_idx](
+                            r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                            x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
+                            obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
+                            has_scatter,
+                            all_apply_cut_sets[s_idx], all_cut_val_sets[s_idx])
+                        pre_nd_list.append(cpdf_2d)
+                    else:
+                        # Dummy for 1D set (never used by all-in-one)
+                        pre_nd_list.append(jnp.zeros((n_cl, n_points_dl)))
+                return tuple(pre_nd_list)
+
             if bc_chunk <= 0 or n_bc <= bc_chunk:
                 # Full vmap: all clusters at once
+                pre_nd_cpdfs = _compute_2d_cores()
                 log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
                     lnM_min, lnM_max, all_obs_vals, all_has_obs,
                     hmf_z_c, skyfracs_clusters,
                     E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                    *shared_args)
+                    *shared_args, pre_nd_cpdfs)
             else:
                 # Chunked: process bc_chunk clusters at a time
                 log_liks_list = []
@@ -1669,12 +1899,13 @@ class cluster_number_counts:
                 for c_start in range(0, n_bc, bc_chunk):
                     c_end = min(c_start + bc_chunk, n_bc)
                     sl = slice(c_start, c_end)
+                    pre_nd_chunk = _compute_2d_cores(sl)
                     ll, cw, lm = self._allinone_bc_jit(
                         lnM_min[sl], lnM_max[sl],
                         all_obs_vals[:, sl], all_has_obs[:, sl],
                         hmf_z_c[sl], skyfracs_clusters[sl],
                         E_z_c[sl], D_A_c[sl], D_l_CMB_c[sl], rho_c_c[sl],
-                        *shared_args)
+                        *shared_args, pre_nd_chunk)
                     log_liks_list.append(ll)
                     cpdf_list.append(cw)
                     lnM_list.append(lm)
