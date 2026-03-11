@@ -1853,7 +1853,6 @@ class cluster_number_counts:
                             set_pref_sr, set_layer0_sr, set_layer1_sr)
 
                         # Pre-compute covariance inverse and normalization
-                        cov1 = all_cov_layer0[s_idx]  # wait, layer indices
                         cov_l1 = all_cov_layer1[s_idx]
                         cov_l0 = all_cov_layer0[s_idx]
                         det1 = cov_l1[0, 0] * cov_l1[1, 1] - cov_l1[0, 1]**2

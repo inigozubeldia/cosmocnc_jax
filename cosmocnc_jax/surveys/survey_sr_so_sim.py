@@ -617,7 +617,8 @@ class scatter:
 
                 cov = self.params["sigma_lnp"]**2
 
-            elif observable1 == "p_so_sim" and observable2 == "q_so_sim":
+            elif ((observable1 == "p_so_sim" and observable2 == "q_so_sim") or
+                  (observable1 == "q_so_sim" and observable2 == "p_so_sim")):
 
                 cov =  self.params["corr_lnq_lnp"]*self.params["sigma_lnq_szifi"]*self.params["sigma_lnp"]
 

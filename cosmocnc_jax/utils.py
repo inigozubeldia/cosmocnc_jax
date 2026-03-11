@@ -167,11 +167,45 @@ def _circular_convolve(a, kernel):
     Much faster than linear (padded) convolution since no zero-padding
     is needed. Safe when both signal and kernel decay to ~0 at boundaries.
     Works for any dimensionality (1D, 2D, 3D, ...).
+
+    The kernel center is assumed at index (n-1)//2 in each dimension
+    (matching the ``x - mean(x) + 0.5*dx`` convention used for kernel
+    coordinates).  We use ``roll`` rather than ``ifftshift`` because
+    ifftshift shifts by n//2, which is off by one for even n.
     """
-    kernel_shifted = jnp.fft.ifftshift(kernel)
+    shifts = tuple(-((s - 1) // 2) for s in kernel.shape)
+    kernel_shifted = jnp.roll(kernel, shifts, axis=tuple(range(kernel.ndim)))
     A = jnp.fft.fftn(a)
     K = jnp.fft.fftn(kernel_shifted)
     return jnp.fft.ifftn(A * K).real
+
+
+def _fft_convolve_same_nd(a, kernel):
+    """Linear (zero-padded) FFT convolution with 'same' mode for N-D arrays.
+
+    Equivalent to scipy.signal.convolve(a, kernel, mode='same').
+    Uses jnp.fft.fftn directly to avoid cuFFT batched plan issues.
+    """
+    ndim = a.ndim
+    # Pad to next power of 2 >= n+m-1 in each dim for efficient FFT
+    fft_shape = []
+    for i in range(ndim):
+        size = a.shape[i] + kernel.shape[i] - 1
+        fft_size = 1
+        while fft_size < size:
+            fft_size *= 2
+        fft_shape.append(fft_size)
+
+    A = jnp.fft.fftn(a, s=fft_shape)
+    K = jnp.fft.fftn(kernel, s=fft_shape)
+    result = jnp.fft.ifftn(A * K).real
+
+    # 'same' mode: extract center crop of size a.shape
+    slices = []
+    for i in range(ndim):
+        start = (kernel.shape[i] - 1) // 2
+        slices.append(slice(start, start + a.shape[i]))
+    return result[tuple(slices)]
 
 
 def convolve_nd(distribution, kernel):
