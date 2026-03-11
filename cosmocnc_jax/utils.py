@@ -161,9 +161,25 @@ def convolve_1d(x, dn_dx, sigma=None, type="fft", kernel=None, sigma_min=0):
     return jnp.where(sigma > sigma_min, convolved, dn_dx)
 
 
+def _circular_convolve(a, kernel):
+    """Circular convolution — no padding, kernel assumed centered.
+
+    Much faster than linear (padded) convolution since no zero-padding
+    is needed. Safe when both signal and kernel decay to ~0 at boundaries.
+    Works for any dimensionality (1D, 2D, 3D, ...).
+    """
+    kernel_shifted = jnp.fft.ifftshift(kernel)
+    A = jnp.fft.fftn(a)
+    K = jnp.fft.fftn(kernel_shifted)
+    return jnp.fft.ifftn(A * K).real
+
+
 def convolve_nd(distribution, kernel):
 
-    convolved = _fft_convolve_same(distribution, kernel) / jnp.sum(kernel)
+    if distribution.ndim == 1:
+        convolved = _fft_convolve_same(distribution, kernel) / jnp.sum(kernel)
+    else:
+        convolved = _circular_convolve(distribution, kernel) / jnp.sum(kernel)
 
     return convolved
 

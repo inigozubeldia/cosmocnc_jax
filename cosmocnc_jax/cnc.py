@@ -86,6 +86,164 @@ def _bilinear_interp_2d(xi0, xi1, grid, x0_start, dx0, n0, x1_start, dx1, n1):
     return v00 * (1 - t0) * (1 - t1) + v01 * (1 - t0) * t1 + v10 * t0 * (1 - t1) + v11 * t0 * t1
 
 
+
+def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs):
+    """Factory: build an N-dimensional backward conv for a correlation set.
+
+    Handles N correlated observables with full covariance structure across layers.
+    For n_obs=1, this reduces to the same algorithm as build_backward_conv_1d.
+
+    Args:
+        layer0_fns: list of N pure JAX layer-0 functions
+        layer1_fns: list of N pure JAX layer-1 functions
+        layer0_returns_aux_list: list of N booleans
+        n_obs: number of observables in the correlation set
+
+    Returns:
+        backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
+                          cov_layer0, cov_layer1, n_points,
+                          apply_cutoff, cutoff_val)
+        → (n_points,) cpdf on the mass grid
+
+        obs_vals: (n_obs,) observed values
+        all_layer0_args: tuple of n_obs tuples (prefactors + sr_params per obs)
+        all_layer1_args: tuple of n_obs tuples (sr_params per obs)
+        cov_layer0: (n_obs, n_obs) covariance matrix for layer 0
+        cov_layer1: (n_obs, n_obs) covariance matrix for layer 1
+    """
+
+    def backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
+                          cov_layer0, cov_layer1, n_points,
+                          apply_cutoff, cutoff_val):
+
+        # ── Forward pass: layer 0 on lnM grid ──
+        x_l0_list = []
+        x_l0_linear_list = []
+        for j in range(n_obs):
+            if layer0_returns_aux_list[j]:
+                x_l0_j, _ = layer0_fns[j](lnM, *all_layer0_args[j])
+            else:
+                x_l0_j = layer0_fns[j](lnM, *all_layer0_args[j])
+            x_l0_list.append(x_l0_j)
+            x_l0_linear_list.append(jnp.linspace(x_l0_j[0], x_l0_j[-1], n_points))
+
+        # ── Backward pass: start from layer 1 (measurement layer) ──
+
+        # Evaluate layer 1 on linear grids and compute residuals
+        x_l1_residuals = []
+        x_l1_raw = []
+        for j in range(n_obs):
+            if len(all_layer1_args[j]) > 0:
+                x_l1_j = layer1_fns[j](x_l0_linear_list[j], *all_layer1_args[j])
+            else:
+                x_l1_j = layer1_fns[j](x_l0_linear_list[j])
+            x_l1_raw.append(x_l1_j)
+            x_l1_residuals.append(x_l1_j - obs_vals[j])
+
+        if n_obs == 1:
+            # ── 1D path (same as build_backward_conv_1d) ──
+            cpdf = eval_gaussian_nd(
+                jnp.array(x_l1_residuals),  # (1, n_points)
+                cov=cov_layer1)
+
+            # Observable cutoff (on first/only observable)
+            cpdf = jnp.where(apply_cutoff & (x_l1_raw[0] < cutoff_val), 0., cpdf)
+
+            # Layer-0 convolution
+            x_lin = x_l0_linear_list[0]
+            dx = x_lin[1] - x_lin[0]
+            x_kernel = x_lin - jnp.mean(x_lin) + 0.5 * dx
+
+            cov_l0_scalar = cov_layer0[0, 0]
+            kernel = gaussian_1d(x_kernel, jnp.maximum(jnp.sqrt(cov_l0_scalar), 1e-30))
+            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf = jnp.where(cov_l0_scalar > 1e-20, cpdf_conv, cpdf)
+
+            cpdf = jnp.maximum(cpdf, 0.)
+
+            # Interpolate back to original (SR-distorted) grid
+            cpdf = interp_uniform(x_l0_list[0], x_l0_list[0][0], x_l0_list[0][-1],
+                                   n_points, cpdf)
+        elif n_obs == 2:
+            # ── Optimized 2D path ──
+            # Use meshgrid + eval_gaussian_nd (XLA-friendly kernel fusion)
+            x1_stack = jnp.stack(x_l1_residuals)  # (2, n_points)
+            x_mesh = get_mesh(x1_stack)  # (2, n_pts, n_pts)
+            cpdf = eval_gaussian_nd(x_mesh, cov=cov_layer1)
+
+            # Observable cutoff (selection obs = index 0)
+            mask = x_mesh[0] + obs_vals[0] < cutoff_val
+            cpdf = jnp.where(apply_cutoff & mask, 0., cpdf)
+
+            # ── Layer-0 convolution kernel ──
+            x_p_m_list = []
+            for j in range(2):
+                x_lin = x_l0_linear_list[j]
+                dx = x_lin[1] - x_lin[0]
+                x_p_m_list.append(x_lin - jnp.mean(x_lin) + 0.5 * dx)
+
+            x_p_m_stack = jnp.stack(x_p_m_list)
+            x_p_mesh = get_mesh(x_p_m_stack)
+            has_scatter = ~jnp.all(cov_layer0 == 0.)
+            kernel = eval_gaussian_nd(x_p_mesh, cov=cov_layer0)
+            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
+
+            cpdf = jnp.maximum(cpdf, 0.)
+
+            # Bilinear interpolation at diagonal points only
+            xi0 = x_l0_list[0]
+            xi1 = x_l0_list[1]
+            x0s = x_l0_linear_list[0][0]
+            x1s = x_l0_linear_list[1][0]
+            dx0 = x_l0_linear_list[0][1] - x0s
+            dx1 = x_l0_linear_list[1][1] - x1s
+            n_p = n_points
+
+            fi0 = jnp.clip((xi0 - x0s) / dx0, 0., n_p - 1 - 1e-7)
+            fi1 = jnp.clip((xi1 - x1s) / dx1, 0., n_p - 1 - 1e-7)
+            i0 = jnp.clip(jnp.floor(fi0).astype(jnp.int32), 0, n_p - 2)
+            i1 = jnp.clip(jnp.floor(fi1).astype(jnp.int32), 0, n_p - 2)
+            t0 = fi0 - i0
+            t1 = fi1 - i1
+            cpdf = (cpdf[i0, i1] * (1 - t0) * (1 - t1) +
+                    cpdf[i0, i1 + 1] * (1 - t0) * t1 +
+                    cpdf[i0 + 1, i1] * t0 * (1 - t1) +
+                    cpdf[i0 + 1, i1 + 1] * t0 * t1)
+        else:
+            # ── General N-D path (3+ observables) ──
+            x1_stack = jnp.stack(x_l1_residuals)
+            x_mesh = get_mesh(x1_stack)
+            cpdf = eval_gaussian_nd(x_mesh, cov=cov_layer1)
+
+            mask = x_mesh[0] + obs_vals[0] < cutoff_val
+            cpdf = jnp.where(apply_cutoff & mask, 0., cpdf)
+
+            x_p_m_list = []
+            for j in range(n_obs):
+                x_lin = x_l0_linear_list[j]
+                dx = x_lin[1] - x_lin[0]
+                x_p_m_list.append(x_lin - jnp.mean(x_lin) + 0.5 * dx)
+
+            x_p_m_stack = jnp.stack(x_p_m_list)
+            x_p_mesh = get_mesh(x_p_m_stack)
+            has_scatter = ~jnp.all(cov_layer0 == 0.)
+            kernel = eval_gaussian_nd(x_p_mesh, cov=cov_layer0)
+            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
+            cpdf = jnp.maximum(cpdf, 0.)
+
+            diag_points = jnp.stack(x_l0_list, axis=-1)
+            linear_grids = tuple(x_l0_linear_list[j] for j in range(n_obs))
+            interp = RegularGridInterpolator(linear_grids, cpdf,
+                                              fill_value=0., bounds_error=False)
+            cpdf = interp(diag_points)
+
+        return cpdf
+
+    return backward_conv_nd
+
+
 def build_backward_conv_1d(layer0_fn, layer1_fn, layer0_returns_aux=False):
     """Factory: build a generic 1D 2-layer backward conv function.
 
@@ -475,22 +633,55 @@ class cluster_number_counts:
         use_analytical = (self.cnc_params.get("scalrel_type_deriv", "analytical") == "analytical")
         self._use_analytical_deriv = use_analytical
 
-        # ── 1. Backward conv functions for each observable ──
-        self._bc_fns = {}
-        self._bc_obs_list = []
+        # ── 1. Backward conv functions per correlation set ──
+        # _bc_set_fns: list of (bc_fn, obs_names_in_set) per correlation set
+        # _bc_obs_list: flat list of all backward-conv observable names (for data gathering)
+        self._bc_fns = {}          # per-observable 1D backward conv (kept for compatibility)
+        self._bc_obs_list = []     # flat list of all bc observable names
+        self._bc_set_fns = []      # list of (bc_fn, obs_names) per correlation set
+        self._bc_set_obs = []      # list of obs_name lists per correlation set
+        self._all_sets_are_1d = True  # fast-path flag
+
         for observable_set in self.cnc_params["observables"]:
+            # Filter to observables with >= 2 layers (backward conv applicable)
+            bc_obs_in_set = []
             for obs_name in observable_set:
-                if obs_name in self._bc_fns:
-                    continue
                 sr = self.scaling_relations[obs_name]
-                n_layers = sr.get_n_layers()
-                if n_layers >= 2:
-                    layer0_fn = sr.get_layer_fn(0)
-                    layer1_fn = sr.get_layer_fn(1)
-                    layer0_returns_aux = sr.get_layer_returns_aux(0)
+                if sr.get_n_layers() >= 2:
+                    bc_obs_in_set.append(obs_name)
+                    if obs_name not in self._bc_obs_list:
+                        self._bc_obs_list.append(obs_name)
+
+            if len(bc_obs_in_set) == 0:
+                continue
+
+            n_obs_set = len(bc_obs_in_set)
+            if n_obs_set > 1:
+                self._all_sets_are_1d = False
+
+            # Build layer functions for this set
+            layer0_fns = []
+            layer1_fns = []
+            layer0_returns_aux_list = []
+            for obs_name in bc_obs_in_set:
+                sr = self.scaling_relations[obs_name]
+                layer0_fns.append(sr.get_layer_fn(0))
+                layer1_fns.append(sr.get_layer_fn(1))
+                layer0_returns_aux_list.append(sr.get_layer_returns_aux(0))
+
+            # Build N-D backward conv for this correlation set
+            bc_set_fn = build_backward_conv_nd(
+                layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set)
+            self._bc_set_fns.append(bc_set_fn)
+            self._bc_set_obs.append(bc_obs_in_set)
+
+            # Also build per-observable 1D fns (for legacy/compatibility)
+            for obs_name in bc_obs_in_set:
+                if obs_name not in self._bc_fns:
+                    sr = self.scaling_relations[obs_name]
                     self._bc_fns[obs_name] = build_backward_conv_1d(
-                        layer0_fn, layer1_fn, layer0_returns_aux=layer0_returns_aux)
-                    self._bc_obs_list.append(obs_name)
+                        sr.get_layer_fn(0), sr.get_layer_fn(1),
+                        layer0_returns_aux=sr.get_layer_returns_aux(0))
 
         # ── 2. Mass range function for selection observable ──
         layer0_fn_sel = sr_sel.get_layer_fn(0)
@@ -516,51 +707,100 @@ class cluster_number_counts:
             vmap_axes_sel = sr_sel.get_prefactor_vmap_axes()
             self._pref_vmaps[obs_select_name] = jax.vmap(pref_fn_sel, in_axes=vmap_axes_sel)
 
-        # ── 4. All-in-one backward conv JIT: all observables + combine + integrate ──
-        # Single JIT dispatch: computes prefactors, backward conv for all observables,
-        # combines cpdf products, multiplies by HMF, and integrates. Shares lnM grid
-        # and HMF interpolation across observables.
+        # ── 4. All-in-one backward conv JIT: correlation sets + combine + integrate ──
+        # Builds a single JIT function that processes all correlation sets per cluster,
+        # computes prefactors, calls N-D backward conv per set, multiplies cpdf products
+        # across sets, multiplies by HMF × 4π × skyfrac, and integrates.
         n_points_dl = int(self.cnc_params["n_points_data_lik"])
         self._n_pref_sr = {}
-        bc_fn_list = []
-        pref_fn_list = []
-        n_psr_list = []
         for obs_name in self._bc_obs_list:
             sr = self.scaling_relations[obs_name]
-            bc_fn_list.append(self._bc_fns[obs_name])
-            pref_fn_list.append(sr.get_prefactor_fn_unified())
-            n_psr = sr.get_n_prefactor_sr_params()
-            n_psr_list.append(n_psr)
-            self._n_pref_sr[obs_name] = n_psr
+            self._n_pref_sr[obs_name] = sr.get_n_prefactor_sr_params()
+
+        # Build per-set metadata for the all-in-one JIT
+        # Each set needs: bc_set_fn, list of pref_fns, list of n_psr, n_obs_in_set
+        set_bc_fns = []          # N-D backward conv function per set
+        set_pref_fns = []        # list of lists of pref_fn_unified per set
+        set_n_psr = []           # list of lists of n_psr per set
+        set_sizes = []           # n_obs per set
+        set_obs_indices = []     # indices into flat _bc_obs_list per set
+
+        for s_idx, (bc_set_fn, obs_names) in enumerate(
+                zip(self._bc_set_fns, self._bc_set_obs)):
+            set_bc_fns.append(bc_set_fn)
+            pref_fns_set = []
+            n_psr_set = []
+            obs_idx_set = []
+            for obs_name in obs_names:
+                sr = self.scaling_relations[obs_name]
+                pref_fns_set.append(sr.get_prefactor_fn_unified())
+                n_psr_set.append(sr.get_n_prefactor_sr_params())
+                obs_idx_set.append(self._bc_obs_list.index(obs_name))
+            set_pref_fns.append(pref_fns_set)
+            set_n_psr.append(n_psr_set)
+            set_sizes.append(len(obs_names))
+            set_obs_indices.append(obs_idx_set)
+
+        # Also keep flat lists for the vmap interface (data is still stacked flat)
+        flat_pref_fn_list = []
+        flat_n_psr_list = []
+        for obs_name in self._bc_obs_list:
+            sr = self.scaling_relations[obs_name]
+            flat_pref_fn_list.append(sr.get_prefactor_fn_unified())
+            flat_n_psr_list.append(sr.get_n_prefactor_sr_params())
 
         # ── 4b. All-in-one backward conv + combine + integrate JIT ──
-        # One JIT function that processes all observables per cluster, combines
-        # cpdf products, multiplies by HMF × 4π × skyfrac, and integrates.
-        # Shares lnM grid and HMF interpolation across observables.
         padding_frac = self.cnc_params.get("padding_fraction", 0.)
         n_drop_int = int(padding_frac * n_points_dl) if padding_frac > 1e-5 else 0
         n_obs_bc = len(self._bc_obs_list)
+        n_sets = len(set_bc_fns)
 
-        def _make_allinone_bc(bc_fns, pref_fns, n_psr_lst, n_pts, n_o, n_drop):
+        def _make_allinone_bc(s_bc_fns, s_pref_fns, s_n_psr, s_sizes, s_obs_idx,
+                               f_pref_fns, f_n_psr, n_pts, n_o, n_s, n_drop):
             def per_cluster(mn, mx, obs_vals, has_obs_vals, hz, skyfrac,
                             E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
                             H0, D_CMB, gamma,
                             all_pref_sr, all_layer0_sr, all_layer1_sr,
-                            all_scatter_sigma, all_apply_cut, all_cut_val,
+                            all_cov_layer0, all_cov_layer1,
+                            all_apply_cut, all_cut_val,
                             lnM0_min, lnM0_max, n_lnM0):
                 # Shared: lnM grid and HMF interp (computed once)
                 lnM = jnp.linspace(mn, mx, n_pts)
                 hmf = interp_uniform(lnM, lnM0_min, lnM0_max, n_lnM0, hz,
                                      left=0., right=0.)
                 cpdf_product = jnp.ones(n_pts)
-                for i in range(n_o):
-                    prefactors = pref_fns[i](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                                              H0, D_CMB, gamma, *all_pref_sr[i])
-                    layer0_args = prefactors + all_layer0_sr[i]
-                    cpdf = bc_fns[i](lnM, obs_vals[i], layer0_args, all_layer1_sr[i],
-                                     all_scatter_sigma[i], n_pts,
-                                     all_apply_cut[i], all_cut_val[i])
-                    cpdf_product = cpdf_product * jnp.where(has_obs_vals[i], cpdf, 1.)
+
+                for s in range(n_s):
+                    n_obs_s = s_sizes[s]
+                    idx = s_obs_idx[s]  # indices into flat obs arrays
+
+                    # Check if ANY observable in this set is present
+                    any_has = False
+                    for k in range(n_obs_s):
+                        any_has = any_has | has_obs_vals[idx[k]]
+
+                    # Compute prefactors and build args for each obs in set
+                    set_layer0_args = []
+                    set_layer1_args = []
+                    set_obs = []
+                    for k in range(n_obs_s):
+                        i = idx[k]
+                        prefactors = f_pref_fns[i](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                                                    H0, D_CMB, gamma, *all_pref_sr[i])
+                        set_layer0_args.append(prefactors + all_layer0_sr[i])
+                        set_layer1_args.append(all_layer1_sr[i])
+                        set_obs.append(obs_vals[idx[k]])
+
+                    set_obs_arr = jnp.array(set_obs)
+
+                    # Call N-D backward conv for this correlation set
+                    cpdf = s_bc_fns[s](
+                        lnM, set_obs_arr,
+                        tuple(set_layer0_args), tuple(set_layer1_args),
+                        all_cov_layer0[s], all_cov_layer1[s],
+                        n_pts, all_apply_cut[s], all_cut_val[s])
+
+                    cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
 
                 cwh = cpdf_product * hmf * 4. * jnp.pi * skyfrac
                 if n_drop > 0:
@@ -570,27 +810,28 @@ class cluster_number_counts:
                     log_lik = jnp.log(jnp.maximum(simpson(cwh, x=lnM), 1e-300))
                 return log_lik, cwh, lnM
 
-            # Build vmap axes: obs_vals and has_obs_vals are (n_obs,) per cluster,
-            # stacked as (n_obs, n_clusters) -> vmap over axis 1
+            # Build vmap axes
             vmap_in = (
                 0, 0,       # mn, mx
                 1, 1,       # obs_vals (n_obs, n_bc), has_obs_vals (n_obs, n_bc)
                 0, 0,       # hz, skyfrac
                 0, 0, 0, 0, # cosmo per-cluster
                 None, None, None,  # H0, D_CMB, gamma
-                tuple([tuple([None]*n) for n in n_psr_lst]),  # all_pref_sr
+                tuple([tuple([None]*n) for n in f_n_psr]),  # all_pref_sr
                 tuple([None]*n_o),  # all_layer0_sr
                 tuple([None]*n_o),  # all_layer1_sr
-                tuple([None]*n_o),  # all_scatter_sigma
-                tuple([None]*n_o),  # all_apply_cut
-                tuple([None]*n_o),  # all_cut_val
+                tuple([None]*n_s),  # all_cov_layer0 (per-set)
+                tuple([None]*n_s),  # all_cov_layer1 (per-set)
+                tuple([None]*n_s),  # all_apply_cut (per-set)
+                tuple([None]*n_s),  # all_cut_val (per-set)
                 None, None, None,   # lnM0_min, lnM0_max, n_lnM0
             )
-            return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
+            return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in)), per_cluster
 
-        self._allinone_bc_jit = _make_allinone_bc(
-            bc_fn_list, pref_fn_list, n_psr_list, n_points_dl,
-            n_obs_bc, n_drop_int)
+        self._allinone_bc_jit, self._allinone_bc_per_cluster = _make_allinone_bc(
+            set_bc_fns, set_pref_fns, set_n_psr, set_sizes, set_obs_indices,
+            flat_pref_fn_list, flat_n_psr_list, n_points_dl,
+            n_obs_bc, n_sets, n_drop_int)
 
         # ── 4c. Merged mass_range with prefactors JIT ──
         mass_range_fn_inner = self._mass_range_fn
@@ -1358,7 +1599,7 @@ class cluster_number_counts:
             all_obs_vals = jnp.stack([obs_data[o][0] for o in self._bc_obs_list])
             all_has_obs = jnp.stack([obs_data[o][1] for o in self._bc_obs_list])
 
-            # Per-observable SR params (tuples of tuples)
+            # Per-observable SR params (tuples of tuples, flat over _bc_obs_list)
             all_pref_sr = tuple(
                 self.scaling_relations[o].get_prefactor_sr_params(self.scal_rel_params)
                 for o in self._bc_obs_list)
@@ -1368,23 +1609,78 @@ class cluster_number_counts:
             all_layer1_sr = tuple(
                 self.scaling_relations[o].get_layer_sr_params(1, self.scal_rel_params)
                 for o in self._bc_obs_list)
-            all_scatter = tuple(
-                jnp.float64(self.scaling_relations[o].get_scatter_sigma(self.scal_rel_params))
-                for o in self._bc_obs_list)
-            all_apply_cut = tuple(
-                apply_cutoff if o == obs_select_key else False
-                for o in self._bc_obs_list)
-            all_cut_val = tuple(
-                cutoff_val if o == obs_select_key else jnp.float64(-jnp.inf)
-                for o in self._bc_obs_list)
 
-            log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
-                lnM_min, lnM_max, all_obs_vals, all_has_obs, hmf_z_c, skyfracs_clusters,
-                E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                H0_jnp, D_CMB_jnp, gamma_jnp,
-                all_pref_sr, all_layer0_sr, all_layer1_sr,
-                all_scatter, all_apply_cut, all_cut_val,
-                lnM0_min, lnM0_max, n_lnM0)
+            # Per-correlation-set: covariance matrices, cutoff config
+            all_cov_layer0 = []
+            all_cov_layer1 = []
+            all_apply_cut_sets = []
+            all_cut_val_sets = []
+
+            for obs_names in self._bc_set_obs:
+                n_obs_s = len(obs_names)
+                # Build covariance matrices for this set
+                cov_l0 = jnp.zeros((n_obs_s, n_obs_s))
+                cov_l1 = jnp.zeros((n_obs_s, n_obs_s))
+                for i in range(n_obs_s):
+                    for j in range(n_obs_s):
+                        cov_l0 = cov_l0.at[i, j].set(
+                            self.scatter.get_cov(
+                                observable1=obs_names[i], observable2=obs_names[j],
+                                layer=0, patch1=0, patch2=0))
+                        cov_l1 = cov_l1.at[i, j].set(
+                            self.scatter.get_cov(
+                                observable1=obs_names[i], observable2=obs_names[j],
+                                layer=1, patch1=0, patch2=0))
+                all_cov_layer0.append(cov_l0)
+                all_cov_layer1.append(cov_l1)
+
+                # Cutoff: applied if selection observable is in this set
+                set_has_cutoff = obs_select_key in obs_names
+                all_apply_cut_sets.append(apply_cutoff and set_has_cutoff)
+                all_cut_val_sets.append(
+                    cutoff_val if set_has_cutoff else jnp.float64(-jnp.inf))
+
+            all_cov_layer0 = tuple(all_cov_layer0)
+            all_cov_layer1 = tuple(all_cov_layer1)
+            all_apply_cut_sets = tuple(all_apply_cut_sets)
+            all_cut_val_sets = tuple(all_cut_val_sets)
+
+            bc_chunk = int(self.cnc_params.get("bc_chunk_size", 0))
+
+            # Shared (non-per-cluster) args
+            shared_args = (H0_jnp, D_CMB_jnp, gamma_jnp,
+                           all_pref_sr, all_layer0_sr, all_layer1_sr,
+                           all_cov_layer0, all_cov_layer1,
+                           all_apply_cut_sets, all_cut_val_sets,
+                           lnM0_min, lnM0_max, n_lnM0)
+
+            if bc_chunk <= 0 or n_bc <= bc_chunk:
+                # Full vmap: all clusters at once
+                log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
+                    lnM_min, lnM_max, all_obs_vals, all_has_obs,
+                    hmf_z_c, skyfracs_clusters,
+                    E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                    *shared_args)
+            else:
+                # Chunked: process bc_chunk clusters at a time
+                log_liks_list = []
+                cpdf_list = []
+                lnM_list = []
+                for c_start in range(0, n_bc, bc_chunk):
+                    c_end = min(c_start + bc_chunk, n_bc)
+                    sl = slice(c_start, c_end)
+                    ll, cw, lm = self._allinone_bc_jit(
+                        lnM_min[sl], lnM_max[sl],
+                        all_obs_vals[:, sl], all_has_obs[:, sl],
+                        hmf_z_c[sl], skyfracs_clusters[sl],
+                        E_z_c[sl], D_A_c[sl], D_l_CMB_c[sl], rho_c_c[sl],
+                        *shared_args)
+                    log_liks_list.append(ll)
+                    cpdf_list.append(cw)
+                    lnM_list.append(lm)
+                log_liks = jnp.concatenate(log_liks_list)
+                cpdf_with_hmf = jnp.concatenate(cpdf_list)
+                lnM_grid = jnp.concatenate(lnM_list)
 
             log_lik_data_rank = jnp.sum(log_liks)
 
