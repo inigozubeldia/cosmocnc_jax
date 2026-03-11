@@ -22,6 +22,70 @@ import sys
 _N_COARSE_MASS = 128
 
 
+def _bilinear_interp_3d(xi0, xi1, patch_idx, tensor, x0_start, dx0, n0, x1_start, dx1, n1):
+    """Vectorized bilinear interpolation on a 3D tensor indexed by patch.
+
+    Gathers only the 4 corner values per query point (no full-slice expansion).
+
+    Args:
+        xi0: (N,) query points along axis 0 (e.g. redshift)
+        xi1: (N,) query points along axis 1 (e.g. observable)
+        patch_idx: (N,) int32 patch indices into tensor axis 0
+        tensor: (n_patches, n0, n1) full abundance tensor
+        x0_start, dx0, n0: regular grid spec for axis 0
+        x1_start, dx1, n1: regular grid spec for axis 1
+
+    Returns:
+        (N,) interpolated values
+    """
+    fi0 = (xi0 - x0_start) / dx0
+    fi1 = (xi1 - x1_start) / dx1
+    fi0 = jnp.clip(fi0, 0., n0 - 1 - 1e-7)
+    fi1 = jnp.clip(fi1, 0., n1 - 1 - 1e-7)
+    i0 = jnp.floor(fi0).astype(jnp.int32)
+    i1 = jnp.floor(fi1).astype(jnp.int32)
+    i0 = jnp.clip(i0, 0, n0 - 2)
+    i1 = jnp.clip(i1, 0, n1 - 2)
+    t0 = fi0 - i0
+    t1 = fi1 - i1
+    # Gather only 4 corners per cluster from the 3D tensor
+    v00 = tensor[patch_idx, i0, i1]
+    v01 = tensor[patch_idx, i0, i1 + 1]
+    v10 = tensor[patch_idx, i0 + 1, i1]
+    v11 = tensor[patch_idx, i0 + 1, i1 + 1]
+    return v00 * (1 - t0) * (1 - t1) + v01 * (1 - t0) * t1 + v10 * t0 * (1 - t1) + v11 * t0 * t1
+
+
+def _bilinear_interp_2d(xi0, xi1, grid, x0_start, dx0, n0, x1_start, dx1, n1):
+    """Vectorized bilinear interpolation on a single 2D regular grid.
+
+    Args:
+        xi0: (M,) query points along axis 0
+        xi1: (M,) query points along axis 1
+        grid: (n0, n1) 2D values grid
+        x0_start, dx0, n0: regular grid spec for axis 0
+        x1_start, dx1, n1: regular grid spec for axis 1
+
+    Returns:
+        (M,) interpolated values
+    """
+    fi0 = (xi0 - x0_start) / dx0
+    fi1 = (xi1 - x1_start) / dx1
+    fi0 = jnp.clip(fi0, 0., n0 - 1 - 1e-7)
+    fi1 = jnp.clip(fi1, 0., n1 - 1 - 1e-7)
+    i0 = jnp.floor(fi0).astype(jnp.int32)
+    i1 = jnp.floor(fi1).astype(jnp.int32)
+    i0 = jnp.clip(i0, 0, n0 - 2)
+    i1 = jnp.clip(i1, 0, n1 - 2)
+    t0 = fi0 - i0
+    t1 = fi1 - i1
+    v00 = grid[i0, i1]
+    v01 = grid[i0, i1 + 1]
+    v10 = grid[i0 + 1, i1]
+    v11 = grid[i0 + 1, i1 + 1]
+    return v00 * (1 - t0) * (1 - t1) + v01 * (1 - t0) * t1 + v10 * t0 * (1 - t1) + v11 * t0 * t1
+
+
 def build_backward_conv_1d(layer0_fn, layer1_fn, layer0_returns_aux=False):
     """Factory: build a generic 1D 2-layer backward conv function.
 
@@ -1125,79 +1189,69 @@ class cluster_number_counts:
 
         if self.cnc_params["data_lik_from_abundance"] == True:
 
-            indices_unique = self.catalogue.indices_unique
-            indices_unique_dict = self.catalogue.indices_unique_dict
+            if len(indices_obs_select) > 0:
 
-            for i in range(0,len(indices_unique)):
+                # Gather all clusters in indices_obs_select (all patches at once)
+                z_all = jnp.asarray(self.catalogue.catalogue["z"][indices_obs_select])
+                obs_all = jnp.asarray(self.catalogue.catalogue[self.cnc_params["obs_select"]][indices_obs_select])
+                z_std_all = jnp.asarray(self.catalogue.catalogue["z_std"][indices_obs_select])
+                patch_all = jnp.asarray(
+                    self.catalogue.catalogue_patch[self.cnc_params["obs_select"]][indices_obs_select]
+                ).astype(jnp.int32)
 
-                patch_index = int(indices_unique[i])
-                abundance_matrix = self.abundance_tensor[patch_index,:,:]
+                # Grid metadata for bilinear interpolation (regular grids)
+                z0 = self.redshift_vec[0]
+                dz = self.redshift_vec[1] - self.redshift_vec[0]
+                nz = self.redshift_vec.shape[0]
+                o0 = self.obs_select_vec[0]
+                do = self.obs_select_vec[1] - self.obs_select_vec[0]
+                no = self.obs_select_vec.shape[0]
 
-                abundance_interp = RegularGridInterpolator((self.redshift_vec,self.obs_select_vec),abundance_matrix)
+                if self.cnc_params["z_errors"] == False:
 
-                indices = indices_unique_dict[str(int(patch_index))]
-                z_select = self.catalogue.catalogue["z"][indices_obs_select][indices]
-                obs_select = self.catalogue.catalogue[self.cnc_params["obs_select"]][indices_obs_select][indices]
+                    # Vectorized bilinear interp: gathers 4 corners per cluster from 3D tensor
+                    log_lik_obs_sel = jnp.sum(jnp.log(jnp.maximum(
+                        _bilinear_interp_3d(z_all, obs_all, patch_all,
+                                            self.abundance_tensor,
+                                            z0, dz, nz, o0, do, no),
+                        1e-300)))
+                    log_lik_data = log_lik_data + log_lik_obs_sel
 
-                #If redshift errors are negligible
+                elif self.cnc_params["z_errors"] == True:
 
-                z_std_select = self.catalogue.catalogue["z_std"][indices_obs_select][indices]
+                    z_error_min = self.cnc_params["z_error_min"]
+                    has_z_err = z_std_all >= z_error_min
 
-                if self.cnc_params["z_errors"] == False or all(z_std_select < self.cnc_params["z_error_min"]):
+                    # Clusters without significant z-errors: simple bilinear interp
+                    lik_simple = _bilinear_interp_3d(
+                        z_all, obs_all, patch_all, self.abundance_tensor,
+                        z0, dz, nz, o0, do, no)
 
-                    eval_points = jnp.column_stack([jnp.asarray(z_select), jnp.asarray(obs_select)])
-                    lik_clusters = abundance_interp(eval_points)
-                    log_lik_clusters = jnp.sum(jnp.log(lik_clusters))
+                    # Clusters with z-errors: integrate over z
+                    z_min_bound = jnp.float64(self.cnc_params["z_min"])
+                    z_max_bound = jnp.float64(self.cnc_params["z_max"])
+                    sigma_range = jnp.float64(self.cnc_params["z_error_sigma_integral_range"])
+                    n_z_err_int = int(self.cnc_params["n_z_error_integral"])
+                    abund_tensor_local = self.abundance_tensor
 
-                #If redshift errors are not negligible
+                    def _z_err_cluster_lik(z_c, obs_c, z_std_c, p_idx):
+                        z_lo = jnp.maximum(z_c - sigma_range * z_std_c, z_min_bound)
+                        z_hi = jnp.minimum(z_c + sigma_range * z_std_c, z_max_bound)
+                        z_eval = jnp.linspace(z_lo, z_hi, n_z_err_int)
+                        z_err_lik = gaussian_1d(z_eval - z_c, z_std_c)
+                        # Interpolate on this cluster's patch abundance at multiple z points
+                        abund_mat = abund_tensor_local[p_idx]  # (n_z, n_points) — single slice
+                        abund_z = _bilinear_interp_2d(
+                            z_eval, jnp.full(n_z_err_int, obs_c), abund_mat,
+                            z0, dz, nz, o0, do, no)
+                        return simpson(abund_z * z_err_lik, x=z_eval)
 
-                if self.cnc_params["z_errors"] == True:
+                    lik_z_err = jax.vmap(_z_err_cluster_lik)(
+                        z_all, obs_all, z_std_all, patch_all)
 
-                    if all(z_std_select < self.cnc_params["z_error_min"]):
-
-                        eval_points = jnp.column_stack([jnp.asarray(z_select), jnp.asarray(obs_select)])
-                        lik_clusters = abundance_interp(eval_points)
-                        log_lik_clusters = jnp.sum(jnp.log(lik_clusters))
-
-                    else:
-
-                        indices_z_err = np.where(z_std_select >= self.cnc_params["z_error_min"])[0]
-                        indices_no_z_err = np.where(z_std_select < self.cnc_params["z_error_min"])[0]
-
-                        eval_points_no_err = jnp.column_stack([jnp.asarray(z_select[indices_no_z_err]), jnp.asarray(obs_select[indices_no_z_err])])
-                        lik_clusters_no_z_err = abundance_interp(eval_points_no_err)
-
-                        log_lik_clusters = jnp.sum(jnp.log(lik_clusters_no_z_err))
-
-                        # Vectorized z-error integration for all clusters with z-errors
-                        z_err_redshifts = jnp.asarray(z_select[indices_z_err])
-                        z_err_obs = jnp.asarray(obs_select[indices_z_err])
-                        z_err_stds = jnp.asarray(z_std_select[indices_z_err])
-                        z_min_bound = self.cnc_params["z_min"]
-                        z_max_bound = self.cnc_params["z_max"]
-                        sigma_range = self.cnc_params["z_error_sigma_integral_range"]
-                        n_z_err_int = self.cnc_params["n_z_error_integral"]
-                        redshift_vec_local = self.redshift_vec
-                        obs_select_vec_local = self.obs_select_vec
-                        abund_matrix_local = self.abundance_tensor[patch_index,:,:]
-
-                        def _z_err_cluster_lik(z_c, obs_c, z_std_c):
-                            z_lo = jnp.maximum(z_c - sigma_range * z_std_c, z_min_bound)
-                            z_hi = jnp.minimum(z_c + sigma_range * z_std_c, z_max_bound)
-                            z_eval = jnp.linspace(z_lo, z_hi, n_z_err_int)
-                            z_err_lik = gaussian_1d(z_eval - z_c, z_std_c)
-                            interp = RegularGridInterpolator(
-                                (redshift_vec_local, obs_select_vec_local), abund_matrix_local)
-                            pts = jnp.column_stack([z_eval, jnp.full_like(z_eval, obs_c)])
-                            abund_z = interp(pts)
-                            return simpson(abund_z * z_err_lik, x=z_eval)
-
-                        if len(indices_z_err) > 0:
-                            lik_z_err = jax.vmap(_z_err_cluster_lik)(
-                                z_err_redshifts, z_err_obs, z_err_stds)
-                            log_lik_clusters = log_lik_clusters + jnp.sum(jnp.log(lik_z_err))
-
-                log_lik_data = log_lik_data + log_lik_clusters
+                    # Use z-error result where z_std >= threshold, simple otherwise
+                    lik_final = jnp.where(has_z_err, lik_z_err, lik_simple)
+                    log_lik_data = log_lik_data + jnp.sum(jnp.log(jnp.maximum(lik_final, 1e-300)))
 
         #Computes log lik of data if there are more observables than the selection observable
 
