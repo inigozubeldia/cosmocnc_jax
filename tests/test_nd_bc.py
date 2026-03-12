@@ -122,17 +122,25 @@ def main():
     cnc_params_1d = dict(cnc_params)
     cnc_params_1d["observables"] = [["q_so_sim"], ["p_so_sim"]]
 
+    # JAX params: use classy_sz_jax + hmf_calc=cnc
+    cnc_params_jax = dict(cnc_params)
+    cnc_params_jax["cosmology_tool"] = "classy_sz_jax"
+    cnc_params_jax["hmf_calc"] = "cnc"
+    cnc_params_1d_jax = dict(cnc_params_1d)
+    cnc_params_1d_jax["cosmology_tool"] = "classy_sz_jax"
+    cnc_params_1d_jax["hmf_calc"] = "cnc"
+
     print("\n  Initialising cosmocnc (2D correlated)...")
     nc_orig = setup_and_init(cosmocnc, dict(cnc_params), dict(scal_rel), dict(cosmo))
 
     print("  Initialising cosmocnc_jax (2D correlated)...")
-    nc_jax = setup_and_init(cosmocnc_jax, dict(cnc_params), dict(scal_rel), dict(cosmo))
+    nc_jax = setup_and_init(cosmocnc_jax, dict(cnc_params_jax), dict(scal_rel), dict(cosmo))
 
     print("  Initialising cosmocnc (1D independent)...")
     nc_orig_1d = setup_and_init(cosmocnc, dict(cnc_params_1d), dict(scal_rel), dict(cosmo))
 
     print("  Initialising cosmocnc_jax (1D independent)...")
-    nc_jax_1d = setup_and_init(cosmocnc_jax, dict(cnc_params_1d), dict(scal_rel), dict(cosmo))
+    nc_jax_1d = setup_and_init(cosmocnc_jax, dict(cnc_params_1d_jax), dict(scal_rel), dict(cosmo))
 
     # ── 2D correlated ──
     print("\n  Computing log_lik (cosmocnc, 2D correlated)...")

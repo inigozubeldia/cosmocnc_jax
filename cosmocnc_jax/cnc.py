@@ -12,6 +12,7 @@ from .utils import *
 import time
 import importlib.util
 import sys
+from itertools import combinations
 
 
 # =====================================================================
@@ -157,7 +158,7 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
             cov_l0_scalar = cov_layer0[0, 0]
             kernel = gaussian_1d(x_kernel, jnp.maximum(jnp.sqrt(cov_l0_scalar), 1e-30))
-            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
             cpdf = jnp.where(cov_l0_scalar > 1e-20, cpdf_conv, cpdf)
 
             cpdf = jnp.maximum(cpdf, 0.)
@@ -366,6 +367,66 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
         None, None, None,   # has_scatter, apply_cutoff, cutoff_val
     )
 
+    return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
+
+
+def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
+                     pref_fns, n_psr_list, n_sub, n_pts, nd_circular=True):
+    """Factory: build vmapped JIT for backward conv of a sub-pattern.
+
+    For a subset of observables within a correlation set, wraps
+    build_backward_conv_nd with prefactor computation and vmaps over clusters.
+
+    Use for n_sub=1 or n_sub>=3.  For n_sub=2, use the split-JIT
+    (build_2d_forward_fn + build_2d_conv_fn) to avoid XLA shared-memory
+    overflow on Blackwell GPUs.
+
+    Args:
+        layer0_fns: list of n_sub pure JAX layer-0 functions
+        layer1_fns: list of n_sub pure JAX layer-1 functions
+        layer0_returns_aux_list: list of n_sub booleans
+        pref_fns: list of n_sub prefactor_fn_unified functions
+        n_psr_list: list of n_sub ints (n_prefactor_sr_params per obs)
+        n_sub: number of observables in the sub-pattern
+        n_pts: n_points_data_lik (mass grid resolution)
+        nd_circular: whether to use circular convolution
+
+    Returns:
+        jit(vmap(per_cluster, ...))
+        per_cluster(mn, mx, obs_vals,
+                    E_z, D_A, D_l_CMB, rho_c,
+                    H0, D_CMB, gamma,
+                    all_pref_sr, all_layer0_sr, all_layer1_sr,
+                    cov_l0, cov_l1, apply_cut, cut_val) → cpdf (n_pts,)
+    """
+    bc_fn = build_backward_conv_nd(
+        layer0_fns, layer1_fns, layer0_returns_aux_list, n_sub, nd_circular)
+
+    def per_cluster(mn, mx, obs_vals, E_z, D_A, D_l_CMB, rho_c,
+                    H0, D_CMB, gamma,
+                    all_pref_sr, all_layer0_sr, all_layer1_sr,
+                    cov_l0, cov_l1, apply_cut, cut_val):
+        lnM = jnp.linspace(mn, mx, n_pts)
+        layer0_args = []
+        layer1_args = []
+        for k in range(n_sub):
+            prefs = pref_fns[k](E_z, D_A, D_l_CMB, rho_c,
+                                H0, D_CMB, gamma, *all_pref_sr[k])
+            layer0_args.append(prefs + all_layer0_sr[k])
+            layer1_args.append(all_layer1_sr[k])
+        return bc_fn(lnM, obs_vals, tuple(layer0_args), tuple(layer1_args),
+                     cov_l0, cov_l1, n_pts, apply_cut, cut_val)
+
+    vmap_in = (
+        0, 0, 0,                                         # mn, mx, obs_vals
+        0, 0, 0, 0,                                      # cosmo per-cluster
+        None, None, None,                                 # H0, D_CMB, gamma
+        tuple([tuple([None]*n) for n in n_psr_list]),     # all_pref_sr
+        tuple([None]*n_sub),                              # all_layer0_sr
+        tuple([None]*n_sub),                              # all_layer1_sr
+        None, None,                                       # cov_l0, cov_l1
+        None, None,                                       # apply_cut, cut_val
+    )
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
 
 
@@ -632,11 +693,11 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
 
 class cluster_number_counts:
 
-    def __init__(self,cnc_params=cnc_params_default):
+    def __init__(self,cnc_params=None):
 
-        self.cnc_params = cnc_params
-        self.cosmo_params = cosmo_params_default
-        self.scal_rel_params = scaling_relation_params_default
+        self.cnc_params = dict(cnc_params_default) if cnc_params is None else dict(cnc_params)
+        self.cosmo_params = dict(cosmo_params_default)
+        self.scal_rel_params = dict(scaling_relation_params_default)
 
         self.abundance_matrix = None
         self.n_obs_matrix = None
@@ -908,6 +969,51 @@ class cluster_number_counts:
                     self._bc_obs_list.index(o) for o in obs_names]
             else:
                 s_is_nd.append(False)
+
+        # ── 4b-bis. Sub-pattern JITs for partial observable availability ──
+        # For each 2D+ correlation set, pre-build backward conv JITs for all
+        # proper non-empty subsets.  When a cluster is missing some observables
+        # in a set, we dispatch the appropriate sub-dimensional JIT.
+        self._sub_bc_jits = {}          # (s_idx, sub_indices_tuple) → dict
+        for s_idx, obs_names in enumerate(self._bc_set_obs):
+            n_obs_s = len(obs_names)
+            if n_obs_s < 2:
+                continue
+            full_pat = tuple(range(n_obs_s))
+            # Full pattern → reference to existing 2D split-JIT
+            self._sub_bc_jits[(s_idx, full_pat)] = {
+                'type': '2d_split',
+                'fwd_jit': self._2d_forward_jits[s_idx],
+                'conv_jit': self._2d_conv_jits[s_idx],
+            }
+            # Enumerate all non-empty proper subsets
+            for r in range(1, n_obs_s):
+                for sub_indices in combinations(range(n_obs_s), r):
+                    sub_obs = [obs_names[k] for k in sub_indices]
+                    sub_l0 = [self.scaling_relations[o].get_layer_fn(0) for o in sub_obs]
+                    sub_l1 = [self.scaling_relations[o].get_layer_fn(1) for o in sub_obs]
+                    sub_aux = [self.scaling_relations[o].get_layer_returns_aux(0)
+                               for o in sub_obs]
+                    sub_pref = [self.scaling_relations[o].get_prefactor_fn_unified()
+                                for o in sub_obs]
+                    sub_npsr = [self.scaling_relations[o].get_n_prefactor_sr_params()
+                                for o in sub_obs]
+                    if r == 2:
+                        fwd = build_2d_forward_fn(
+                            sub_l0, sub_l1, sub_aux, sub_pref, sub_npsr,
+                            n_points_dl)
+                        conv = build_2d_conv_fn(n_points_dl, nd_circular=nd_circ)
+                        self._sub_bc_jits[(s_idx, sub_indices)] = {
+                            'type': '2d_split', 'fwd_jit': fwd, 'conv_jit': conv,
+                        }
+                    else:
+                        # 1D or 3+D: generic wrapper
+                        jit_fn = build_sub_bc_jit(
+                            sub_l0, sub_l1, sub_aux, sub_pref, sub_npsr,
+                            r, n_points_dl, nd_circ)
+                        self._sub_bc_jits[(s_idx, sub_indices)] = {
+                            'type': 'generic', 'jit_fn': jit_fn,
+                        }
 
         # ── 4c. All-in-one backward conv + combine + integrate JIT ──
         # For 2D+ sets, uses pre-computed cpdf from split JIT (passed as input).
@@ -1660,6 +1766,7 @@ class cluster_number_counts:
             # ── Cache per-cluster catalogue data (constant across MCMC iterations) ──
             if not hasattr(self, '_bc_cached'):
                 idx_bc = np.asarray(indices_other_obs, dtype=int)
+                n_bc = len(idx_bc)
                 z_clusters = jnp.asarray(self.catalogue.catalogue["z"])[idx_bc]
                 obs_data = {}
                 for obs_name in self._bc_obs_list:
@@ -1675,11 +1782,27 @@ class cluster_number_counts:
                     self.catalogue.catalogue_patch[obs_select_key])[idx_bc].astype(jnp.int32)
                 skyfracs_arr = jnp.array(self.scal_rel_selection.skyfracs)
                 skyfracs_clusters = skyfracs_arr[patch_clusters]
+                # ── Pattern groups: cluster indices per availability pattern per 2D+ set ──
+                pattern_groups = {}
+                for s_idx, obs_names_s in enumerate(self._bc_set_obs):
+                    n_obs_s = len(obs_names_s)
+                    if n_obs_s < 2:
+                        continue
+                    groups = {}
+                    for c in range(n_bc):
+                        present = tuple(k for k in range(n_obs_s)
+                                        if bool(np.asarray(obs_data[obs_names_s[k]][1][c])))
+                        groups.setdefault(present, []).append(c)
+                    pattern_groups[s_idx] = {
+                        pat: np.array(idxs, dtype=int) for pat, idxs in groups.items()
+                    }
+
                 self._bc_cached = {
                     'idx_bc': idx_bc,
                     'z_clusters': z_clusters,
                     'obs_data': obs_data,
                     'skyfracs_clusters': skyfracs_clusters,
+                    'pattern_groups': pattern_groups,
                 }
             else:
                 idx_bc = self._bc_cached['idx_bc']
@@ -1687,6 +1810,7 @@ class cluster_number_counts:
                 obs_data = self._bc_cached['obs_data']
                 skyfracs_clusters = self._bc_cached['skyfracs_clusters']
                 obs_select_key = self.cnc_params["obs_select"]
+                pattern_groups = self._bc_cached['pattern_groups']
 
             n_bc = len(idx_bc)
             sr_sel = self.scaling_relations[obs_select_key]
@@ -1809,75 +1933,156 @@ class cluster_number_counts:
                            all_apply_cut_sets, all_cut_val_sets,
                            lnM0_min, lnM0_max, n_lnM0)
 
-            # ── Split-JIT: compute 2D+ core cpdfs in separate JITs ──
-            # Two stages per 2D set to prevent XLA over-fusion:
-            #   Stage A: forward pass (prefactors + layer-0 + layer-1 → arrays)
-            #   Stage B: 2D conv core (outer-product Gaussian + circular conv + bilinear interp)
-            def _compute_2d_cores(sl=None):
-                """Compute pre_nd_cpdfs for all sets. 2D+ sets use split JIT,
-                1D sets get dummy arrays (never used by all-in-one)."""
+            # ── Pattern-aware split-JIT: compute cpdfs for 2D+ sets ──
+            # For each 2D+ correlation set, groups clusters by which observables
+            # are present and dispatches the appropriate sub-dimensional JIT.
+            # 1D sets get dummy arrays (computed inline by the all-in-one JIT).
+
+            def _dispatch_2d_split(fwd_jit, conv_jit, mn, mx, set_obs,
+                                   ez, da, dl, rc,
+                                   sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                   sub_cov_l0, sub_cov_l1,
+                                   sub_apply_cut, sub_cut_val):
+                """Run 2D split-JIT (forward + conv) for a cluster group."""
+                (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                 x_lin_0_start, x_lin_1_start,
+                 dx0_arr, dx1_arr) = fwd_jit(
+                    mn, mx, set_obs, ez, da, dl, rc,
+                    H0_jnp, D_CMB_jnp, gamma_jnp,
+                    sub_pref_sr, sub_layer0_sr, sub_layer1_sr)
+
+                det1 = sub_cov_l1[0, 0] * sub_cov_l1[1, 1] - sub_cov_l1[0, 1]**2
+                inv_cov1 = jnp.array([[sub_cov_l1[1, 1], -sub_cov_l1[0, 1]],
+                                       [-sub_cov_l1[0, 1], sub_cov_l1[0, 0]]]) / det1
+                norm1 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det1)
+
+                det0 = sub_cov_l0[0, 0] * sub_cov_l0[1, 1] - sub_cov_l0[0, 1]**2
+                inv_cov0 = jnp.array([[sub_cov_l0[1, 1], -sub_cov_l0[0, 1]],
+                                       [-sub_cov_l0[0, 1], sub_cov_l0[0, 0]]]) / det0
+                norm0 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det0)
+                has_scatter = ~jnp.all(sub_cov_l0 == 0.)
+
+                obs_val_0 = set_obs[:, 0]
+                return conv_jit(
+                    r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                    x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
+                    obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
+                    has_scatter, sub_apply_cut, sub_cut_val)
+
+            def _compute_all_set_cpdfs(sl=None):
+                """Compute pre_nd_cpdfs for all sets with pattern-aware dispatch.
+
+                For each 2D+ correlation set, groups clusters by observable
+                availability pattern and dispatches the appropriate sub-JIT
+                (full 2D, 1D marginal, etc.).  1D sets get dummy arrays.
+                """
                 pre_nd_list = []
                 n_cl = n_bc if sl is None else sl.stop - sl.start
+
                 for s_idx in range(len(self._bc_set_obs)):
-                    if s_idx in self._2d_forward_jits:
-                        idx_list = self._2d_core_obs_indices[s_idx]
-                        # obs_vals for this 2D set: (n_bc, 2)
-                        set_obs = jnp.stack(
-                            [all_obs_vals[i, sl] if sl else all_obs_vals[i]
-                             for i in idx_list], axis=1)
-                        set_pref_sr = tuple(all_pref_sr[i] for i in idx_list)
-                        set_layer0_sr = tuple(all_layer0_sr[i] for i in idx_list)
-                        set_layer1_sr = tuple(all_layer1_sr[i] for i in idx_list)
+                    obs_names_s = self._bc_set_obs[s_idx]
+                    n_obs_s = len(obs_names_s)
 
-                        mn = lnM_min[sl] if sl else lnM_min
-                        mx = lnM_max[sl] if sl else lnM_max
-                        ez = E_z_c[sl] if sl else E_z_c
-                        da = D_A_c[sl] if sl else D_A_c
-                        dl = D_l_CMB_c[sl] if sl else D_l_CMB_c
-                        rc = rho_c_c[sl] if sl else rho_c_c
-
-                        # Stage A: forward pass
-                        (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
-                         x_lin_0_start, x_lin_1_start,
-                         dx0_arr, dx1_arr) = self._2d_forward_jits[s_idx](
-                            mn, mx, set_obs,
-                            ez, da, dl, rc,
-                            H0_jnp, D_CMB_jnp, gamma_jnp,
-                            set_pref_sr, set_layer0_sr, set_layer1_sr)
-
-                        # Pre-compute covariance inverse and normalization
-                        cov_l1 = all_cov_layer1[s_idx]
-                        cov_l0 = all_cov_layer0[s_idx]
-                        det1 = cov_l1[0, 0] * cov_l1[1, 1] - cov_l1[0, 1]**2
-                        inv_cov1 = jnp.array([[cov_l1[1, 1], -cov_l1[0, 1]],
-                                               [-cov_l1[0, 1], cov_l1[0, 0]]]) / det1
-                        norm1 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det1)
-
-                        det0 = cov_l0[0, 0] * cov_l0[1, 1] - cov_l0[0, 1]**2
-                        inv_cov0 = jnp.array([[cov_l0[1, 1], -cov_l0[0, 1]],
-                                               [-cov_l0[0, 1], cov_l0[0, 0]]]) / det0
-                        norm0 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det0)
-                        has_scatter = ~jnp.all(cov_l0 == 0.)
-
-                        # obs_val_0 per cluster (for cutoff)
-                        obs_val_0 = set_obs[:, 0]
-
-                        # Stage B: 2D conv core
-                        cpdf_2d = self._2d_conv_jits[s_idx](
-                            r0, r1, kc0, kc1, x_l0_0, x_l0_1,
-                            x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
-                            obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
-                            has_scatter,
-                            all_apply_cut_sets[s_idx], all_cut_val_sets[s_idx])
-                        pre_nd_list.append(cpdf_2d)
-                    else:
-                        # Dummy for 1D set (never used by all-in-one)
+                    if n_obs_s < 2:
+                        # 1D set: dummy (computed inline by all-in-one JIT)
                         pre_nd_list.append(jnp.zeros((n_cl, n_points_dl)))
+                        continue
+
+                    # 2D+ set: pattern-aware dispatch
+                    cpdf_set = jnp.zeros((n_cl, n_points_dl))
+                    idx_flat = self._2d_core_obs_indices[s_idx]
+
+                    for pattern, ci_global in pattern_groups.get(s_idx, {}).items():
+                        n_sub = len(pattern)
+                        if n_sub == 0:
+                            continue
+
+                        # Intersect with chunk slice
+                        if sl is not None:
+                            mask = (ci_global >= sl.start) & (ci_global < sl.stop)
+                            ci_g = ci_global[mask]
+                            if len(ci_g) == 0:
+                                continue
+                            ci_l = ci_g - sl.start
+                        else:
+                            ci_g = ci_global
+                            ci_l = ci_global
+                        ci_g_jnp = jnp.array(ci_g)
+                        ci_l_jnp = jnp.array(ci_l)
+
+                        # Gather per-cluster quantities
+                        mn = lnM_min[ci_g_jnp]
+                        mx = lnM_max[ci_g_jnp]
+                        ez = E_z_c[ci_g_jnp]
+                        da = D_A_c[ci_g_jnp]
+                        dl = D_l_CMB_c[ci_g_jnp]
+                        rc = rho_c_c[ci_g_jnp]
+
+                        # Sub-pattern observable names
+                        sub_obs = [obs_names_s[k] for k in pattern]
+
+                        # SR params for sub-pattern
+                        sub_pref_sr = tuple(
+                            self.scaling_relations[o].get_prefactor_sr_params(
+                                self.scal_rel_params)
+                            for o in sub_obs)
+                        sub_layer0_sr = tuple(
+                            self.scaling_relations[o].get_layer_sr_params(
+                                0, self.scal_rel_params)
+                            for o in sub_obs)
+                        sub_layer1_sr = tuple(
+                            self.scaling_relations[o].get_layer_sr_params(
+                                1, self.scal_rel_params)
+                            for o in sub_obs)
+
+                        # Covariance submatrix
+                        si = jnp.array(list(pattern))
+                        sub_cov_l0 = all_cov_layer0[s_idx][si][:, si]
+                        sub_cov_l1 = all_cov_layer1[s_idx][si][:, si]
+
+                        # Cutoff: apply only if selection obs is first in sub-pattern
+                        sel_at_0 = (len(sub_obs) > 0
+                                    and sub_obs[0] == obs_select_key)
+                        sub_apply_cut = (apply_cutoff and sel_at_0)
+                        sub_cut_val = (cutoff_val if sel_at_0
+                                       else jnp.float64(-jnp.inf))
+
+                        jit_info = self._sub_bc_jits.get((s_idx, pattern))
+                        if jit_info is None:
+                            continue
+
+                        if jit_info['type'] == '2d_split':
+                            set_obs = jnp.stack(
+                                [obs_data[sub_obs[j]][0][ci_g_jnp]
+                                 for j in range(2)], axis=1)
+                            cpdf_sub = _dispatch_2d_split(
+                                jit_info['fwd_jit'], jit_info['conv_jit'],
+                                mn, mx, set_obs, ez, da, dl, rc,
+                                sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                sub_cov_l0, sub_cov_l1,
+                                sub_apply_cut, sub_cut_val)
+                        elif jit_info['type'] == 'generic':
+                            set_obs = jnp.stack(
+                                [obs_data[sub_obs[j]][0][ci_g_jnp]
+                                 for j in range(n_sub)], axis=1)
+                            cpdf_sub = jit_info['jit_fn'](
+                                mn, mx, set_obs, ez, da, dl, rc,
+                                H0_jnp, D_CMB_jnp, gamma_jnp,
+                                sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                sub_cov_l0, sub_cov_l1,
+                                sub_apply_cut, sub_cut_val)
+                        else:
+                            continue
+
+                        cpdf_set = cpdf_set.at[ci_l_jnp].set(cpdf_sub)
+
+                    pre_nd_list.append(cpdf_set)
+
                 return tuple(pre_nd_list)
 
             if bc_chunk <= 0 or n_bc <= bc_chunk:
                 # Full vmap: all clusters at once
-                pre_nd_cpdfs = _compute_2d_cores()
+                pre_nd_cpdfs = _compute_all_set_cpdfs()
                 log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
                     lnM_min, lnM_max, all_obs_vals, all_has_obs,
                     hmf_z_c, skyfracs_clusters,
@@ -1891,7 +2096,7 @@ class cluster_number_counts:
                 for c_start in range(0, n_bc, bc_chunk):
                     c_end = min(c_start + bc_chunk, n_bc)
                     sl = slice(c_start, c_end)
-                    pre_nd_chunk = _compute_2d_cores(sl)
+                    pre_nd_chunk = _compute_all_set_cpdfs(sl)
                     ll, cw, lm = self._allinone_bc_jit(
                         lnM_min[sl], lnM_max[sl],
                         all_obs_vals[:, sl], all_has_obs[:, sl],
