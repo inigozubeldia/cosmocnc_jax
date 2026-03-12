@@ -59,7 +59,7 @@ class cnc(classy):
 
     #hmf parameters
 
-    cosmology_tool:  Optional[str] = "astropy" # current options are astropy (and cosmopower), classy, and classy_sz (fast-mode)
+    cosmology_tool:  Optional[str] = "classy_sz_jax"
     M_min : Optional[str] =  1e13
     M_max : Optional[str] =  1e16
     hmf_calc : Optional[str] =  "cnc" #"cnc", "hmf", or "MiraTitan"

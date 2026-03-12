@@ -87,7 +87,8 @@ def _bilinear_interp_2d(xi0, xi1, grid, x0_start, dx0, n0, x1_start, dx1, n1):
 
 
 
-def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs):
+def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs,
+                           nd_circular=True):
     """Factory: build an N-dimensional backward conv for a correlation set.
 
     Handles N correlated observables with full covariance structure across layers.
@@ -186,7 +187,7 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
             x_p_mesh = get_mesh(x_p_m_stack)
             has_scatter = ~jnp.all(cov_layer0 == 0.)
             kernel = eval_gaussian_nd(x_p_mesh, cov=cov_layer0)
-            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
             cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
 
             cpdf = jnp.maximum(cpdf, 0.)
@@ -229,7 +230,7 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
             x_p_mesh = get_mesh(x_p_m_stack)
             has_scatter = ~jnp.all(cov_layer0 == 0.)
             kernel = eval_gaussian_nd(x_p_mesh, cov=cov_layer0)
-            cpdf_conv = convolve_nd(cpdf, kernel)
+            cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
             cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
             cpdf = jnp.maximum(cpdf, 0.)
 
@@ -310,7 +311,7 @@ def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
 
 
-def build_2d_conv_fn(n_pts):
+def build_2d_conv_fn(n_pts, nd_circular=True):
     """Factory: pure-math 2D conv core (separate JIT stage B).
 
     Takes pre-computed arrays from the forward pass. No SR functions inside —
@@ -338,8 +339,7 @@ def build_2d_conv_fn(n_pts):
                  2. * inv_cov0[0, 1] * kc0[:, None] * kc1[None, :])
         kernel = norm0 * jnp.exp(-0.5 * maha0)
 
-        # Circular convolution
-        cpdf_conv = convolve_nd(cpdf, kernel)
+        cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
         cpdf = jnp.where(has_scatter, cpdf_conv, cpdf)
         cpdf = jnp.maximum(cpdf, 0.)
 
@@ -687,7 +687,6 @@ class cluster_number_counts:
 
         self.cosmology = cosmology_model(cosmo_params=self.cosmo_params,
                                          cosmology_tool = self.cnc_params["cosmology_tool"],
-                                         power_spectrum_type=self.cnc_params["power_spectrum_type"],
                                          amplitude_parameter=self.cnc_params["cosmo_amplitude_parameter"],
                                          cnc_params = self.cnc_params,
                                          logger = self.logger
@@ -795,8 +794,10 @@ class cluster_number_counts:
                 layer0_returns_aux_list.append(sr.get_layer_returns_aux(0))
 
             # Build N-D backward conv for this correlation set
+            nd_circular = self.cnc_params.get("nd_convolution_mode", "linear") == "circular"
             bc_set_fn = build_backward_conv_nd(
-                layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set)
+                layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set,
+                nd_circular=nd_circular)
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
 
@@ -901,7 +902,8 @@ class cluster_number_counts:
                 p_nsr = [self.scaling_relations[o].get_n_prefactor_sr_params() for o in obs_names]
                 self._2d_forward_jits[s_idx] = build_2d_forward_fn(
                     l0_fns, l1_fns, l0_aux, p_fns, p_nsr, n_points_dl)
-                self._2d_conv_jits[s_idx] = build_2d_conv_fn(n_points_dl)
+                nd_circ = self.cnc_params.get("nd_convolution_mode", "linear") == "circular"
+                self._2d_conv_jits[s_idx] = build_2d_conv_fn(n_points_dl, nd_circular=nd_circ)
                 self._2d_core_obs_indices[s_idx] = [
                     self._bc_obs_list.index(o) for o in obs_names]
             else:
@@ -1299,9 +1301,7 @@ class cluster_number_counts:
 
                         # Compute Delta (overdensity w.r.t. mean) for this redshift
                         if self.cnc_params["mass_definition"][-1] == "c":
-                            if self.cosmology.cnc_params["cosmology_tool"] == "classy_sz":
-                                rescale = 1./self.cosmology.get_delta_mean_from_delta_crit_at_z(1.,z_i)
-                            elif self.cosmology.cnc_params["cosmology_tool"] == "cobaya_cosmo":
+                            if self.cosmology.cnc_params["cosmology_tool"] == "cobaya_cosmo":
                                 rescale = self.cosmology.Om(z_i)/(self.cosmology.H(z_i)/100.)**2
                             else:
                                 rescale = self.cosmology.cosmo_params["Om0"]*(1.+z_i)**3/(self.cosmology.background_cosmology.H(z_i).value/(self.cosmology.cosmo_params["h"]*100.))**2
@@ -1365,13 +1365,6 @@ class cluster_number_counts:
         elif self.cnc_params["hmf_calc"] == "MiraTitan":
 
             self.ln_M,self.hmf_matrix = self.halo_mass_function.eval_hmf(np.asarray(self.redshift_vec),log=True,volume_element=volume_element)
-
-        elif self.cnc_params["hmf_calc"] == "classy_sz":
-
-            self.logger.info('Collecting hmf')
-
-            self.ln_M,self.hmf_matrix = self.halo_mass_function.eval_hmf(np.asarray(self.redshift_vec),log=True,volume_element=volume_element)
-            self.logger.debug('Collecting hmf done')
 
         t1 = time.time()
 

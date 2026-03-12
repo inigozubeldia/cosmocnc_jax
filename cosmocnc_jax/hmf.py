@@ -252,11 +252,7 @@ class halo_mass_function:
 
                 if self.mass_definition[-1] == "c":
 
-                    if self.cosmology.cnc_params["cosmology_tool"] == "classy_sz":
-
-                        rescale = 1./self.cosmology.get_delta_mean_from_delta_crit_at_z(1.,redshift)
-
-                    elif self.cosmology.cnc_params["cosmology_tool"] == "cobaya_cosmo":
+                    if self.cosmology.cnc_params["cosmology_tool"] == "cobaya_cosmo":
 
                         rescale = self.cosmology.Om(redshift)/(self.cosmology.H(redshift)/100.)**2
 
@@ -330,35 +326,7 @@ class halo_mass_function:
 
                         hmf = hmf.at[i,:].set(hmf[i,:]*self.cosmology.background_cosmology.differential_comoving_volume(redshift[i]).value)
 
-        elif self.hmf_calc == "classy_sz":
-
-            self.logger.debug(f'hmf_calc: {self.hmf_calc}')
-            self.logger.debug(f'testing to evaluate hmf {self.cosmology.get_dndlnM_at_z_and_M(0.6,5e14)}')
-
-            if log == True:
-
-                M_vec = np.exp(np.linspace(np.log(M_min),np.log(M_max),n_points))
-                M_vec_h = M_vec*self.h
-                self.logger.debug(f'hmf: {np.shape(redshift)}, {np.shape(M_vec_h)}')
-
-                hmf  =  np.zeros((len(redshift),len(M_vec_h)))
-
-                for i in range(len(redshift)):
-                    hmf[i,:] = self.cosmology.get_dndlnM_at_z_and_M(redshift[i],M_vec_h)*1e14/M_vec_h*self.h**4
-                    if volume_element == True:
-                        hmf[i,:] *=self.cosmology.background_cosmology.differential_comoving_volume(redshift[i]).value
-
-                self.logger.debug(f'hmf: {np.shape(hmf)}')
-                hmf *= M_vec/1e14
-                M_eval = np.log(M_vec/1e14)
-                if np.isnan(hmf).any():
-                    print('nan in hmf')
-
-                hmf = jnp.asarray(hmf)
-                M_eval = jnp.asarray(M_eval)
-
-
-        if volume_element == True and self.hmf_calc != "MiraTitan" and self.hmf_calc != "classy_sz":
+        if volume_element == True and self.hmf_calc != "MiraTitan":
 
             hmf = hmf*self.cosmology.background_cosmology.differential_comoving_volume(redshift).value
 

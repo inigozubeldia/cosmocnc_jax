@@ -208,12 +208,15 @@ def _fft_convolve_same_nd(a, kernel):
     return result[tuple(slices)]
 
 
-def convolve_nd(distribution, kernel):
+def convolve_nd(distribution, kernel, circular=True):
 
     if distribution.ndim == 1:
         convolved = _fft_convolve_same(distribution, kernel) / jnp.sum(kernel)
     else:
-        convolved = _circular_convolve(distribution, kernel) / jnp.sum(kernel)
+        if circular:
+            convolved = _circular_convolve(distribution, kernel) / jnp.sum(kernel)
+        else:
+            convolved = _fft_convolve_same_nd(distribution, kernel) / jnp.sum(kernel)
 
     return convolved
 

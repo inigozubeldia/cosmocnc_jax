@@ -55,11 +55,11 @@ class CNCLike(InstallableLikelihood):
 
     #cosmology and hmf parameters
 
-    cosmology_tool: Optional[str] = "cobaya" #"astropy", "classy_sz", or "cobaya"
+    cosmology_tool: Optional[str] = "cobaya" #"classy_sz_jax", "astropy", or "cobaya"
     M_min: Optional[float] = 5e13
     M_max: Optional[float] = 5e15
     M_min_extended: Optional[float] = None
-    hmf_calc:  Optional[str] = "cnc" #"cnc", "hmf", "MiraTitan", or "classy_sz"
+    hmf_calc:  Optional[str] = "cnc" #"cnc", "hmf", or "MiraTitan"
     hmf_type: Optional[str] = "Tinker08"
     mass_definition: Optional[str] = "500c"
     hmf_type_deriv: Optional[str] = "numerical" #"analytical" or "numerical"

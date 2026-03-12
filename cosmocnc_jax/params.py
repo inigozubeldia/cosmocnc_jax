@@ -26,6 +26,16 @@ cnc_params_default = {
     "pad_abundance": False,
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
 
+    # nd_convolution_mode: Convolution mode for N-D (2D+) backward convolution.
+    #   "circular": Circular FFT convolution — ~4x faster (90ms vs 420ms at npts=128
+    #     for 2D). Safe when both signal and kernel decay to ~0 at the grid boundaries,
+    #     which is typically the case. Should be verified for each new observable setup.
+    #   "linear": Zero-padded linear convolution (equivalent to scipy convolve 'same').
+    #     Stable and correct regardless of boundary conditions, but slower due to
+    #     padding to next power-of-2.
+    #   Does not affect 1D convolutions (always linear).
+    "nd_convolution_mode": "linear",
+
     #Observables and catalogue
 
     "load_catalogue": True,
@@ -50,13 +60,20 @@ cnc_params_default = {
     "z_min": 0.01,
     "z_max": 1.01,
 
-    #cosmology and hmf parameters
+    # Cosmology and HMF parameters
+    #
+    # cosmology_tool: "classy_sz_jax" uses direct CosmoPowerJAX emulators,
+    #   keeping the entire hot path (update_params -> get_log_lik) in JAX.
+    #   update_params is ~5ms (pure JAX, no Cython in hot path).
+    #
+    # hmf_calc: "cnc" computes the HMF internally using mcfit + Tinker08,
+    #   fully in JAX. Required for classy_sz_jax.
 
-    "cosmology_tool": "classy_sz", #"astropy" or "classy_sz"
+    "cosmology_tool": "classy_sz_jax",
     "M_min": 5e13,
     "M_max": 5e15,
     "M_min_extended": None,
-    "hmf_calc": "cnc", #"cnc", "hmf", "MiraTitan", or "classy_sz"
+    "hmf_calc": "cnc", # "cnc" (JAX, required for classy_sz_jax), "hmf", "MiraTitan"
     "hmf_type": "Tinker08",
     "mass_definition": "500c",
     "hmf_type_deriv": "numerical", #"analytical" or "numerical"
