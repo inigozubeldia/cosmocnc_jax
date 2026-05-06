@@ -148,8 +148,15 @@ class CNCBinnedPlanckScatterLikelihood(Likelihood):
             cosmo["h"] = float(params_values["H0"]) / 100.0
         if "omega_b" in params_values:
             cosmo["Ob0h2"] = float(params_values["omega_b"])
+        # Cobaya configs may sample Omega_m and define omega_cdm as a derived param.
+        # In that case omega_cdm will NOT be present in params_values, so derive it here
+        # to ensure Omega_m actually affects the likelihood.
+        if "Omega_m" in params_values:
+            cosmo["Om0"] = float(params_values["Omega_m"])
         if "omega_cdm" in params_values:
             cosmo["Oc0h2"] = float(params_values["omega_cdm"])
+        elif "Omega_m" in params_values and "h" in cosmo and "Ob0h2" in cosmo:
+            cosmo["Oc0h2"] = float(params_values["Omega_m"]) * float(cosmo["h"]) ** 2 - float(cosmo["Ob0h2"])
         if "ln10_10A_s" in params_values:
             cosmo["A_s"] = 1.0e-10 * float(np.exp(float(params_values["ln10_10A_s"])))
 
