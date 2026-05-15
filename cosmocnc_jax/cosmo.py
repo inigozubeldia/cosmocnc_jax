@@ -388,6 +388,111 @@ class cosmology_model:
         deg_ncdm = _DEG_NCDM_PER_MODEL.get(self.cnc_params["cosmo_model"], 1)
         self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
 
+    def _compute_sigma_M_at_z(self, M_phys_vec, z_vec):
+        """sigma(M, z) on a (n_z, n_M) grid using the JAX PKL emulator + FFTLog.
+
+        Args:
+            M_phys_vec: 1D array of physical masses in Msun (cosmocnc_jax
+                convention — same units the HMF expects).
+            z_vec: 1D array of redshifts.
+
+        Returns:
+            sigma_matrix of shape (len(z_vec), len(M_phys_vec)).
+
+        Mirrors the FFTLog machinery in cnc.py:get_hmf. Caches TophatVar
+        on self so re-creation cost is paid once per cosmology object.
+        """
+        from cosmocnc_jax.emulators import build_cosmo_vec
+        from cosmocnc_jax.hmf import build_batch_sigma_fns, batch_sigma_R_from_tophat
+        from mcfit import TophatVar
+
+        pkl_keys = [k for k in self._emu_param_orders['pkl']
+                    if k != 'z_pk_save_nonclass']
+        cosmo_vec_pkl = build_cosmo_vec(self._pvd, pkl_keys)
+        pk_batch = self._predict_pk_batch(cosmo_vec_pkl, jnp.asarray(z_vec))
+
+        # rho_m in Msun/Mpc^3 -- matches cnc.py:1511
+        rho_c_0 = self.background_cosmology.critical_density(0.).value
+        # convert g/cm^3 → Msun/Mpc^3 via cnc.py's constants(): mpc^3 / solar * 1e3
+        # We reuse the cosmology object's already-set background_cosmology.
+        from cosmocnc_jax.hmf import constants as _hmf_constants
+        _c = _hmf_constants()
+        rho_c_0 = rho_c_0 * _c.mpc**3 / _c.solar * 1e3
+        rho_m = rho_c_0 * self.cosmo_params["Om0"]
+
+        if not hasattr(self, '_tv0_mc'):
+            k_arr_np = np.asarray(self._k_arr)
+            self._tv0_mc = TophatVar(k_arr_np, lowring=True, deriv=0, backend='jax')
+            self._tv1_mc = TophatVar(k_arr_np, lowring=True, deriv=1, backend='jax')
+            self._batch_sigma_fns_mc = build_batch_sigma_fns(
+                self._tv0_mc, self._tv1_mc, self._k_arr, type_deriv="analytical")
+
+        sigma_matrix, _, _ = batch_sigma_R_from_tophat(
+            self._tv0_mc, self._tv1_mc, pk_batch, self._k_arr,
+            jnp.asarray(M_phys_vec), rho_m,
+            type_deriv="analytical",
+            _cached_fns=self._batch_sigma_fns_mc)
+        return sigma_matrix
+
+    def compute_log_m500c_over_m200c_grid(self, z_tab, lnM_tab_phys_1e14,
+                                          n_sigma_grid=200, margin=2.0):
+        """JAX-native M_200c → M_500c grid via classy_sz's virial-intermediate
+        path: σ-based B13 c_vir, NFW Newton for M_vir, then NFW Newton for M_500c.
+
+        Args:
+            z_tab: 1D array of redshifts.
+            lnM_tab_phys_1e14: 1D array of ln(M_200c / 1e14 Msun), in physical
+                Msun units (matches the SR's x0 convention).
+            n_sigma_grid: number of mass points for the internal sigma(M, z) grid.
+                Default 200; the M_vir Newton interpolates against this.
+            margin: factor of mass-range extension on each side of [M_min, M_max]
+                so the M_vir Newton's working range stays inside the sigma grid.
+
+        Returns:
+            log(M_500c / M_200c) on the (z, lnM) grid, shape
+            (len(z_tab), len(lnM_tab_phys_1e14)).
+        """
+        from cosmocnc_jax.mass_conversion import (
+            log_m500c_over_m200c_grid_virial,
+            growth_factor_carroll_press_turner,
+        )
+        from cosmocnc_jax.hmf import constants as _hmf_constants
+
+        z_tab = jnp.asarray(z_tab)
+        lnM_tab_phys_1e14 = jnp.asarray(lnM_tab_phys_1e14)
+        # M_200c grid in physical Msun
+        M_200c_vec = jnp.exp(lnM_tab_phys_1e14) * 1e14
+
+        # Sigma grid: span [M_min/margin, M_max*margin] in physical Msun, so the
+        # M_vir Newton (which can wander ~10-20% from M_200c) stays inside.
+        lnM_min = lnM_tab_phys_1e14[0] + jnp.log(1e14) - jnp.log(margin)
+        lnM_max = lnM_tab_phys_1e14[-1] + jnp.log(1e14) + jnp.log(margin)
+        logM_grid_for_sigma = jnp.linspace(lnM_min, lnM_max, n_sigma_grid)
+        M_for_sigma = jnp.exp(logM_grid_for_sigma)
+
+        sigma_grid = self._compute_sigma_M_at_z(M_for_sigma, z_tab)
+
+        # Cosmology side: D(z), Omega_m(z), rho_crit(z) in Msun/Mpc^3
+        Om0 = self._Om0
+        OL0 = self._Ol0
+        Or0 = self._Or0
+        D_z_tab = growth_factor_carroll_press_turner(z_tab, Om0, OL0)
+
+        z1 = 1.0 + z_tab
+        Ez2 = Om0 * z1**3 + OL0 + Or0 * z1**4
+        Om_z_tab = Om0 * z1**3 / Ez2
+
+        h = self.cosmo_params["h"]
+        rho_c_0_in_Msun_Mpc3 = (
+            self.background_cosmology.critical_density(0.).value
+            * _hmf_constants().mpc**3 / _hmf_constants().solar * 1e3
+        )
+        rho_c_z_tab = rho_c_0_in_Msun_Mpc3 * Ez2
+
+        return log_m500c_over_m200c_grid_virial(
+            M_200c_vec, z_tab, rho_c_z_tab, Om_z_tab, D_z_tab,
+            logM_grid_for_sigma, sigma_grid)
+
     def _Omega_m_z_nonu(self, z):
         """Omega_m(z) without neutrinos — for Delta conversion.
         Matches classy.pyx get_delta_mean_from_delta_crit_at_z (lines 3266-3275)."""
