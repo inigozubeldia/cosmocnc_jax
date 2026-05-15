@@ -21,6 +21,15 @@ _HMFAST_EMU_FOR_MODEL = {
     "ede-v2": "ede:v2",
 }
 
+# Number of degenerate massive-neutrino states per cosmo_model.
+_DEG_NCDM_PER_MODEL = {
+    "lcdm": 1, "mnu": 1, "wcdm": 1, "neff": 1,
+    "mnu-3states": 3, "ede": 1, "ede-v2": 1,
+}
+# Per-state massive-neutrino contribution to N_eff
+# (classy default T_ncdm/T_gamma ratio with instantaneous decoupling).
+_NCDM_NEFF_CONTRIBUTION = 1.0132
+
 
 def _import_hmfast(hmfast_path=None):
     """Import the hmfast package, optionally forcing it to come from
@@ -86,6 +95,7 @@ class cosmology_model:
 
             self.z_CMB = cobaya_cosmology.z_cmb
             self.D_CMB = self.background_cosmology.angular_diameter_distance(self.z_CMB).value
+            self._cobaya_set_om_budget()
 
 
         elif cosmology_tool == "classy_sz_jax":
@@ -331,30 +341,52 @@ class cosmology_model:
         if not hasattr(self, 'T_CMB_0'):
             self.T_CMB_0 = self.classy.T_cmb()
 
-        # Precompute Omega components for Delta conversion (matching get_all_relevant_params).
-        # Omega_nu is not cached: m_nu and h can change per MCMC step, and the
-        # hmfast branch follows the same convention.
         h = self.cosmo_params["h"]
+        deg_ncdm = _DEG_NCDM_PER_MODEL.get(self.cnc_params['cosmo_model'], 1)
         Ob = self._pvd['omega_b'] / h**2
         Ocdm = self._pvd['omega_cdm'] / h**2
         m_ncdm = self._pvd.get('m_ncdm', 0.06)
-        deg_ncdm = 1  # lcdm default
         Oncdm = deg_ncdm * m_ncdm / (93.14 * h**2)
+        self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
+
+    def _set_om_budget(self, Ob, Ocdm, Oncdm, deg_ncdm):
+        """Populate self.Omega_nu, self.cosmo_params['Onu0'], and the
+        Omega-budget attributes used by _Omega_m_z_nonu. Shared by all
+        cosmology backends (classy_sz_jax, hmfast, cobaya) so the same
+        Delta-conversion formula is fed consistent components."""
         self.Omega_nu = float(Oncdm)
         self.cosmo_params["Onu0"] = self.Omega_nu
         self._Om0 = Ocdm + Ob + Oncdm
         self._Om0_nonu = self._Om0 - Oncdm
-        # Radiation: Omega_gamma from Stefan-Boltzmann
-        sigma_B = 5.670374419e-8  # W/m²/K⁴
+
+        h = self.cosmo_params["h"]
+        sigma_B = 5.670374419e-8
         _c = 2.99792458e8
         _G = 6.67428e-11
         _Mpc_m = 3.085677581282e22
         Og = (4. * sigma_B / _c * self.T_CMB_0**4) / (
             3. * _c**2 * 1e10 * h**2 / _Mpc_m**2 / 8. / np.pi / _G)
-        N_ur = 2.0328  # lcdm default (N_eff=3.046 with deg_ncdm=1)
+        N_ur = self.N_eff - deg_ncdm * _NCDM_NEFF_CONTRIBUTION
         Our = N_ur * 7./8. * (4./11.)**(4./3.) * Og
         self._Or0 = Our + Og
         self._Ol0 = 1. - Og - Ob - Ocdm - Oncdm - Our
+
+    def _cobaya_set_om_budget(self):
+        """Populate Omega budget for the cobaya backend.
+
+        Cobaya does not feed us _pvd; read Ob/Ocdm/Oncdm from cosmo_params
+        instead. T_CMB_0 and N_eff are not exposed by cobaya_cosmo so default
+        them to FIRAS / lcdm if unset.
+        """
+        if not hasattr(self, "T_CMB_0"):
+            self.T_CMB_0 = 2.7255
+        if not hasattr(self, "N_eff"):
+            self.N_eff = self.cosmo_params.get("N_eff", 3.046)
+        Ob = self.cosmo_params["Ob0"]
+        Oncdm = self.cosmo_params.get("Onu0", 0.0)
+        Ocdm = self.cosmo_params["Om0"] - Ob - Oncdm
+        deg_ncdm = _DEG_NCDM_PER_MODEL.get(self.cnc_params["cosmo_model"], 1)
+        self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
 
     def _Omega_m_z_nonu(self, z):
         """Omega_m(z) without neutrinos — for Delta conversion.
@@ -548,33 +580,16 @@ class cosmology_model:
         # angular diameter distance to recombination: D_A = chi / (1+z)
         self.D_CMB = float(der[8]) / (1. + self.z_CMB)
 
-        # T_CMB and Omega_nu (constant; pull from hmfast cosmology)
         if not hasattr(self, "T_CMB_0"):
             self.T_CMB_0 = float(self._hmfast_cosmo.T_cmb)
-        h = self.cosmo_params["h"]
-        m_ncdm = self._hmfast_cosmo.m_ncdm
-        deg_ncdm = self._hmfast_cosmo.deg_ncdm
-        self.Omega_nu = float(deg_ncdm * m_ncdm / (93.14 * h**2))
-        self.cosmo_params["Onu0"] = self.Omega_nu
 
-        # Precompute Omega components for Delta conversion (mirrors classy
-        # branch). Use the lcdm default of N_ur=2.0328 for lcdm to match
-        # classy's radiation budget exactly.
+        h = self.cosmo_params["h"]
+        deg_ncdm = self._hmfast_cosmo.deg_ncdm
         Ob = self._pvd["omega_b"] / h**2
         Ocdm = self._pvd["omega_cdm"] / h**2
-        Oncdm = self.Omega_nu
-        self._Om0 = Ocdm + Ob + Oncdm
-        self._Om0_nonu = self._Om0 - Oncdm
-        sigma_B = 5.670374419e-8
-        _c = 2.99792458e8
-        _G = 6.67428e-11
-        _Mpc_m = 3.085677581282e22
-        Og = (4. * sigma_B / _c * self.T_CMB_0**4) / (
-            3. * _c**2 * 1e10 * h**2 / _Mpc_m**2 / 8. / np.pi / _G)
-        N_ur = 2.0328  # lcdm default (matches classy_sz_jax branch)
-        Our = N_ur * 7. / 8. * (4. / 11.)**(4. / 3.) * Og
-        self._Or0 = Our + Og
-        self._Ol0 = 1. - Og - Ob - Ocdm - Oncdm - Our
+        m_ncdm = self._hmfast_cosmo.m_ncdm
+        Oncdm = deg_ncdm * m_ncdm / (93.14 * h**2)
+        self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
 
 
     def update_cosmology(self,cosmo_params_new,cosmology_tool = "astropy"):
@@ -660,6 +675,7 @@ class cosmology_model:
 
             self.z_CMB = cobaya_cosmology.z_cmb
             self.D_CMB = self.background_cosmology.angular_diameter_distance(self.z_CMB).value
+            self._cobaya_set_om_budget()
 
         theta_mc = self.get_theta_mc()
 
