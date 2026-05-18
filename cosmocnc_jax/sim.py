@@ -486,68 +486,77 @@ class catalogue_generator:
                     if isinstance(x1[obs], jnp.ndarray):
                         x1[obs] = np.array(x1[obs])
 
-                for k in range(0, n_clusters):
+                obs_list = self.params_cnc["observables"][0]
+                n_obs_set = len(obs_list)
 
-                    observable_patches_cluster = {}
-                    other_params_cluster = {}
+                if i < n_layers - 1:
 
-                    for key_name in observable_patches.keys():
+                    # Vectorised cov build: call scatter.get_cov ONCE per (i, j)
+                    # with array zc. For z-dependent observables (e.g. shear
+                    # via Magneticum), it returns (n_clusters,); for constant
+                    # observables it returns a scalar that broadcasts.
+                    cov_batched = np.zeros((n_clusters, n_obs_set, n_obs_set),
+                                            dtype=np.float64)
+                    for ii in range(n_obs_set):
+                        for jj in range(n_obs_set):
+                            val = self.scatter.get_cov(
+                                observable1=obs_list[ii], observable2=obs_list[jj],
+                                patch1=0, patch2=0, layer=i,
+                                other_params=other_params)
+                            cov_batched[:, ii, jj] = val
 
-                        observable_patches_cluster[key_name] = observable_patches[key_name][k]
+                    # Symmetrise + small ridge for numerical stability of
+                    # Cholesky on near-singular matrices.
+                    cov_batched = 0.5 * (cov_batched + cov_batched.swapaxes(-1, -2))
+                    eye_n = np.eye(n_obs_set)[None, :, :] * 1e-30
+                    chol = np.asarray(jnp.linalg.cholesky(
+                        jnp.asarray(cov_batched + eye_n)))
+                    key_noise = self._next_key()
+                    z = np.asarray(jrandom.normal(key_noise,
+                                                   shape=(n_clusters, n_obs_set)))
+                    noise_batched = np.einsum('cij,cj->ci', chol, z)
+                    for obs_idx, obs in enumerate(obs_list):
+                        x1[obs] = x1[obs] + noise_batched[:, obs_idx]
 
-                    for key_name in other_params.keys():
+                elif i == n_layers - 1:
 
-                        if isinstance(other_params[key_name], float) or key_name == "cosmology":
+                    obs_vec = self.params_cnc["observable_vector"]
+                    has_vector_obs = isinstance(obs_vec, dict) and any(obs_vec.values())
 
-                            other_params_cluster[key_name] = other_params[key_name]
+                    if has_vector_obs:
 
-                        else:
+                        # Scalar observables at the last layer — vectorised.
+                        scalar_obs = [o for o in obs_list
+                                       if self.params_cnc["observable_vector"][o] is False]
+                        for obs in scalar_obs:
+                            cov_arr = self.scatter.get_cov(
+                                observable1=obs, observable2=obs,
+                                patch1=0, patch2=0, layer=i,
+                                other_params=other_params)
+                            sigma_arr = np.sqrt(np.maximum(
+                                np.asarray(cov_arr) * np.ones(n_clusters), 0.))
+                            key_noise = self._next_key()
+                            z = np.asarray(jrandom.normal(key_noise,
+                                                           shape=(n_clusters,)))
+                            x1[obs] = x1[obs] + sigma_arr * z
 
-                            other_params_cluster[key_name] = other_params[key_name][k]
-
-                    if i < n_layers - 1:
-
-                        covariance = covariance_matrix(self.scatter, self.params_cnc["observables"][0],
-                            observable_patches=observable_patches_cluster, layer=np.arange(n_layers), other_params=other_params_cluster)
-                        cov = covariance.cov[i]
-
-                        key_noise = self._next_key()
-                        noise = np.array(jrandom.multivariate_normal(
-                            key_noise, jnp.zeros(n_observables), cov, shape=(1,)).T)
-
-                        kk = 0
-
-                        for observable in self.params_cnc["observables"][0]:
-
-                            x1[observable][k] = x1[observable][k] + noise[kk, 0]
-                            kk = kk + 1
-
-                    elif i == n_layers - 1:
-
-                        obs_vec = self.params_cnc["observable_vector"]
-                        has_vector_obs = isinstance(obs_vec, dict) and any(obs_vec.values())
-
-                        if has_vector_obs:
-
-                            for observable in self.params_cnc["observables"][0]:
-
-                                if self.params_cnc["observable_vector"][observable] is False:
-
-                                    covariance = covariance_matrix(self.scatter, [observable],
-                                        observable_patches=observable_patches_cluster, layer=np.arange(n_layers), other_params=other_params_cluster)
-                                    cov = covariance.cov[i]
-
-                                    key_noise = self._next_key()
-                                    noise = np.array(jrandom.multivariate_normal(
-                                        key_noise, jnp.array([0.]), cov, shape=(1,)).T)
-                                    x1[observable][k] = x1[observable][k] + noise[0][0]
-
-                                elif self.params_cnc["observable_vector"][observable] is True:
-
-                                    key_noise = self._next_key()
-                                    std = self.std_vec_dict[observable]
-                                    noise = np.array(jrandom.normal(key_noise, shape=(len(std),)) * std)
-                                    x1[observable][k] = x1[observable][k] + noise
+                        # Vector observables — per-radial-bin Gaussian noise
+                        # using std_vec_dict.
+                        vector_obs = [o for o in obs_list
+                                       if self.params_cnc["observable_vector"][o] is True]
+                        for obs in vector_obs:
+                            std = np.asarray(self.std_vec_dict[obs])
+                            key_noise = self._next_key()
+                            z = np.asarray(jrandom.normal(
+                                key_noise, shape=(n_clusters, len(std))))
+                            # x1[obs] for vector obs is either (n_clusters, n_radii)
+                            # or list-of-arrays. Handle both.
+                            if isinstance(x1[obs], np.ndarray) and x1[obs].ndim == 2:
+                                x1[obs] = x1[obs] + z * std[None, :]
+                            else:
+                                # list-of-arrays fallback
+                                for k in range(n_clusters):
+                                    x1[obs][k] = x1[obs][k] + z[k] * std
 
             x0 = x1
 

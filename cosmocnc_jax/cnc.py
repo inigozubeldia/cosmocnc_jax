@@ -392,9 +392,10 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
         0, 0, 0, 0, 0, 0,  # r0, r1, kc0, kc1, x_l0_0, x_l0_1
         0, 0, 0, 0,        # x_lin_0_start, x_lin_1_start, dx0, dx1
         0,                  # obs_val_0 (per-cluster for cutoff)
-        None, None,         # inv_cov1, norm1
-        None, None,         # inv_cov0, norm0
-        None, None, None,   # has_scatter, apply_cutoff, cutoff_val
+        0, 0,               # inv_cov1, norm1 (per-cluster)
+        0, 0,               # inv_cov0, norm0 (per-cluster)
+        0,                  # has_scatter (per-cluster)
+        None, None,         # apply_cutoff, cutoff_val
     )
 
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
@@ -458,7 +459,7 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
         tuple([tuple([None]*n) for n in n_psr_list]),     # all_pref_sr (n_patches, ...)
         tuple([None]*n_sub),                              # all_layer0_sr (n_patches, ...)
         tuple([None]*n_sub),                              # all_layer1_sr (n_patches, ...)
-        None, None,                                       # cov_l0, cov_l1
+        0, 0,                                             # cov_l0, cov_l1 (per-cluster)
         None, None,                                       # apply_cut, cut_val
         0,                                                # patch_idx (per-cluster)
     )
@@ -1176,8 +1177,8 @@ class cluster_number_counts:
                 tuple([None]*n_o),  # all_layer1_sr (n_patches, ...)
                 tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l0]),  # per-cluster L0
                 tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l1]),  # per-cluster L1
-                tuple([None]*n_s),  # all_cov_layer0 (per-set)
-                tuple([None]*n_s),  # all_cov_layer1 (per-set)
+                tuple([0]*n_s),     # all_cov_layer0 (n_bc, n_obs, n_obs) per-set
+                tuple([0]*n_s),     # all_cov_layer1 (n_bc, n_obs, n_obs) per-set
                 tuple([None]*n_s),  # all_apply_cut (per-set)
                 tuple([None]*n_s),  # all_cut_val (per-set)
                 None, None, None,   # lnM0_min, lnM0_max, n_lnM0
@@ -1918,7 +1919,8 @@ class cluster_number_counts:
             if not hasattr(self, '_bc_cached'):
                 idx_bc = np.asarray(indices_other_obs, dtype=int)
                 n_bc = len(idx_bc)
-                z_clusters = jnp.asarray(self.catalogue.catalogue["z"])[idx_bc]
+                z_np = np.asarray(self.catalogue.catalogue["z"])[idx_bc]
+                z_clusters = jnp.asarray(z_np)
                 obs_data = {}
                 for obs_name in self._bc_obs_list:
                     if obs_name in self.catalogue.catalogue:
@@ -1977,6 +1979,7 @@ class cluster_number_counts:
                 self._bc_cached = {
                     'idx_bc': idx_bc,
                     'z_clusters': z_clusters,
+                    'z_np': z_np,
                     'obs_data': obs_data,
                     'skyfracs_clusters': skyfracs_clusters,
                     'patch_clusters': patch_clusters,
@@ -2109,22 +2112,35 @@ class cluster_number_counts:
             all_layer1_sr_pc = tuple(_get_pc_sliced(o, 1) for o in self._bc_obs_list)
 
             # Per-correlation-set: covariance matrices, cutoff config
-            # Build cov in numpy then convert once (avoids N² jnp.at[].set() dispatches)
+            # Build cov as (n_bc, n_obs, n_obs) so each cluster sees its own
+            # covariance matrix. For observables whose scatter is z-independent
+            # (e.g. q_szifi, p_obs), get_cov returns a scalar and broadcasts
+            # across the cluster axis; for shear_des_y3 layer 0, get_cov(z_cluster=...)
+            # returns an (n_bc,) array via the Magneticum B13 z-dependent scatter.
             all_cov_layer0 = []
             all_cov_layer1 = []
             all_apply_cut_sets = []
             all_cut_val_sets = []
+            # Per-cluster z passed through the standard NumPy idiom
+            # other_params['zc'] — vectorised: scatter classes that depend on
+            # z (e.g. Planck shear via Magneticum) consume this as an (n_bc,)
+            # numpy array; classes that don't ignore it.
+            cov_other_params = {"zc": self._bc_cached['z_np']}
 
             for obs_names in self._bc_set_obs:
                 n_obs_s = len(obs_names)
-                cov_l0_np = np.array([[
-                    self.scatter.get_cov(observable1=obs_names[i], observable2=obs_names[j],
-                                         layer=0, patch1=0, patch2=0)
-                    for j in range(n_obs_s)] for i in range(n_obs_s)])
-                cov_l1_np = np.array([[
-                    self.scatter.get_cov(observable1=obs_names[i], observable2=obs_names[j],
-                                         layer=1, patch1=0, patch2=0)
-                    for j in range(n_obs_s)] for i in range(n_obs_s)])
+                cov_l0_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
+                cov_l1_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
+                for i in range(n_obs_s):
+                    for j in range(n_obs_s):
+                        cov_l0_np[:, i, j] = self.scatter.get_cov(
+                            observable1=obs_names[i], observable2=obs_names[j],
+                            layer=0, patch1=0, patch2=0,
+                            other_params=cov_other_params)
+                        cov_l1_np[:, i, j] = self.scatter.get_cov(
+                            observable1=obs_names[i], observable2=obs_names[j],
+                            layer=1, patch1=0, patch2=0,
+                            other_params=cov_other_params)
                 all_cov_layer0.append(jnp.asarray(cov_l0_np))
                 all_cov_layer1.append(jnp.asarray(cov_l1_np))
 
@@ -2186,7 +2202,12 @@ class cluster_number_counts:
                                    sub_cov_l0, sub_cov_l1,
                                    sub_apply_cut, sub_cut_val,
                                    patch_sub):
-                """Run 2D split-JIT (forward + conv) for a cluster group."""
+                """Run 2D split-JIT (forward + conv) for a cluster group.
+
+                sub_cov_l0, sub_cov_l1 are (n_group, 2, 2) — per-cluster
+                covariances for this pattern group. The conv_jit vmaps over
+                the leading cluster axis.
+                """
                 (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
                  x_lin_0_start, x_lin_1_start,
                  dx0_arr, dx1_arr) = fwd_jit(
@@ -2196,16 +2217,26 @@ class cluster_number_counts:
                     sub_l0_pc, sub_l1_pc,
                     patch_sub)
 
-                det1 = sub_cov_l1[0, 0] * sub_cov_l1[1, 1] - sub_cov_l1[0, 1]**2
-                inv_cov1 = jnp.array([[sub_cov_l1[1, 1], -sub_cov_l1[0, 1]],
-                                       [-sub_cov_l1[0, 1], sub_cov_l1[0, 0]]]) / det1
+                # Per-cluster 2x2 inverse + normalisation (layer 1)
+                a1, b1, c1, d1 = (sub_cov_l1[:, 0, 0], sub_cov_l1[:, 0, 1],
+                                  sub_cov_l1[:, 1, 0], sub_cov_l1[:, 1, 1])
+                det1 = a1 * d1 - b1**2
+                inv_cov1 = jnp.stack([
+                    jnp.stack([d1, -b1], axis=-1),
+                    jnp.stack([-b1, a1], axis=-1),
+                ], axis=-2) / det1[:, None, None]
                 norm1 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det1)
 
-                det0 = sub_cov_l0[0, 0] * sub_cov_l0[1, 1] - sub_cov_l0[0, 1]**2
-                inv_cov0 = jnp.array([[sub_cov_l0[1, 1], -sub_cov_l0[0, 1]],
-                                       [-sub_cov_l0[0, 1], sub_cov_l0[0, 0]]]) / det0
+                # Per-cluster 2x2 inverse + normalisation (layer 0)
+                a0, b0, c0, d0 = (sub_cov_l0[:, 0, 0], sub_cov_l0[:, 0, 1],
+                                  sub_cov_l0[:, 1, 0], sub_cov_l0[:, 1, 1])
+                det0 = a0 * d0 - b0**2
+                inv_cov0 = jnp.stack([
+                    jnp.stack([d0, -b0], axis=-1),
+                    jnp.stack([-b0, a0], axis=-1),
+                ], axis=-2) / det0[:, None, None]
                 norm0 = 1.0 / jnp.sqrt((2. * jnp.pi)**2 * det0)
-                has_scatter = ~jnp.all(sub_cov_l0 == 0.)
+                has_scatter = jnp.any(sub_cov_l0 != 0., axis=(1, 2))
 
                 obs_val_0 = set_obs[:, 0]
                 return conv_jit(
@@ -2275,10 +2306,13 @@ class cluster_number_counts:
                         # Per-cluster patch indices for this group
                         patch_sub = patch_clusters[ci_g_jnp]
 
-                        # Covariance submatrix
+                        # Covariance submatrix, per-cluster:
+                        # all_cov_layer{0,1}[s_idx] has shape (n_bc, n_obs_s, n_obs_s).
+                        # Restrict to this group's clusters and to the sub-pattern's
+                        # observables → (n_g, n_sub, n_sub).
                         si = jnp.array(list(pattern))
-                        sub_cov_l0 = all_cov_layer0[s_idx][si][:, si]
-                        sub_cov_l1 = all_cov_layer1[s_idx][si][:, si]
+                        sub_cov_l0 = all_cov_layer0[s_idx][ci_g_jnp][:, si][:, :, si]
+                        sub_cov_l1 = all_cov_layer1[s_idx][ci_g_jnp][:, si][:, :, si]
 
                         # Cutoff: apply only if selection obs is first in sub-pattern
                         sel_at_0 = (len(sub_obs) > 0
@@ -2359,6 +2393,9 @@ class cluster_number_counts:
                     # Slice per-cluster args
                     pc_args_sl = tuple(
                         tuple(p[sl] for p in pc_tuple) for pc_tuple in pc_args)
+                    # Slice per-cluster cov (cov is per-set, each (n_bc, n_obs, n_obs))
+                    cov_l0_sl = tuple(c[sl] for c in shared_args[3])
+                    cov_l1_sl = tuple(c[sl] for c in shared_args[4])
                     # Slice 1-layer per-cluster data (always slice, even dummy arrays)
                     obs_1l_sl = obs_vals_1l[:, sl]
                     has_1l_sl = has_obs_1l[:, sl]
@@ -2372,7 +2409,8 @@ class cluster_number_counts:
                         H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters[sl],
                         shared_args[0], shared_args[1], shared_args[2],
                         *pc_args_sl,
-                        *shared_args[3:],
+                        cov_l0_sl, cov_l1_sl,
+                        *shared_args[5:],
                         patch_clusters[sl],
                         obs_1l_sl, has_1l_sl,
                         pref_sr_1l, l0_sr_1l, l0_pc_1l_sl, cov_1l,
