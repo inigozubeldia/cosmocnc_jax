@@ -626,8 +626,13 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
             x0, *mean_fn_pref_args, *mean_fn_sr_args,
             sigma_intrinsic, compute_var=compute_stacked_cov)
 
-        obs_mean = simpson(mean_vec * cpdf, x=x0)
-        obs_second_moment = simpson((var_vec + mean_vec**2) * cpdf, x=x0)
+        # Support scalar (n_mass,) and vector (n_mass, K, ...) observables:
+        # broadcast cpdf to mean_vec's rank, integrate along the mass axis (0).
+        # Mirrors the numpy cosmocnc behaviour at get_log_lik_stacked
+        # (cnc.py line ~1219: simpson(obs_mean_vec * cpdf[:, np.newaxis], axis=0)).
+        cpdf_b = cpdf.reshape(cpdf.shape + (1,) * (mean_vec.ndim - 1))
+        obs_mean = simpson(mean_vec * cpdf_b, x=x0, axis=0)
+        obs_second_moment = simpson((var_vec + mean_vec**2) * cpdf_b, x=x0, axis=0)
         obs_var = obs_second_moment - obs_mean**2
 
         return obs_mean, obs_var
