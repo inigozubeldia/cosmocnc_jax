@@ -101,16 +101,40 @@ def get_samples_pdf_jax(key, n_samples, x, cpdf):
 
 
 def get_samples_pdf_2d_jax(key, n_samples, x, y, pdf):
-    """2D inverse CDF sampling using JAX with logit-space interpolation."""
+    """2D inverse CDF sampling using JAX with logit-space interpolation.
+
+    CDFs are built with trapezoidal cumulative integration starting at 0:
+      cdf[0] = 0,   cdf[i] = sum_{j<i} 0.5*(pdf[j]+pdf[j+1])*dx
+    Previously the code used `cumsum(pdf)*dx` which gives `cdf[0] = pdf[0]*dx`
+    (not zero). With the logit-space inversion that offset clipped a chunk of
+    samples to x[0] / y[0], biasing the catalogue toward the lower grid
+    boundary (most visible at low z / low lnM where HMF*V is small but the
+    grid still gets a positive cell contribution). The trapezoidal CDF
+    starts at zero by construction and conserves total mass exactly.
+    """
     key1, key2 = jrandom.split(key)
 
     eps = 1e-12
 
-    cpdf_xgy = jnp.cumsum(pdf, axis=0) * (x[1] - x[0])
+    dx = x[1] - x[0]
+    dy = y[1] - y[0]
+
+    # Conditional CDF of x given y (trapezoidal, starts at 0 per column).
+    trap_xgy = 0.5 * (pdf[:-1, :] + pdf[1:, :]) * dx          # (n_x-1, n_y)
+    cpdf_xgy = jnp.concatenate(
+        [jnp.zeros((1, pdf.shape[1]), dtype=pdf.dtype),
+         jnp.cumsum(trap_xgy, axis=0)],
+        axis=0)
     col_max = jnp.max(cpdf_xgy, axis=0, keepdims=True)
     cpdf_xgy = cpdf_xgy / jnp.where(col_max > 0., col_max, 1.)
 
-    cpdf_y = jnp.cumsum(jnp.sum(pdf, axis=0)) * (y[1] - y[0]) * (x[1] - x[0])
+    # Marginal CDF of y (= ∫dx pdf(x, y), trapezoidal in x; then trapezoidal
+    # in y starting at 0).
+    pdf_y_marg = jnp.sum(trap_xgy, axis=0)                    # (n_y,)
+    trap_y = 0.5 * (pdf_y_marg[:-1] + pdf_y_marg[1:]) * dy    # (n_y-1,)
+    cpdf_y = jnp.concatenate(
+        [jnp.zeros(1, dtype=pdf.dtype), jnp.cumsum(trap_y)],
+        axis=0)                                                # (n_y,)
 
     y_samples = get_samples_pdf_jax(key1, n_samples, y, cpdf_y)
 
