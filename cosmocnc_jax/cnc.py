@@ -2448,6 +2448,51 @@ class cluster_number_counts:
 
         return log_lik_data
 
+    def _build_stacked_wrapper(self, stacked_observable, stacked_kernel,
+                                n_mfn_pc, n_l0_pc, n_pref,
+                                n_layers_stacked, n_points_stacked,
+                                compute_stacked_cov, sigma_scatter_min):
+        """Build a jit(vmap(_stacked_one)) wrapper for one stacked observable.
+
+        All per-MCMC-step values are passed as arguments (not closure) so
+        JAX's compile cache hits across iterations. The wrapper is cached
+        on self._stacked_wrappers keyed by observable + shape ints.
+
+        Pytree args:
+          - per_cluster_mfn (tuple of (n_st, ...))    in_axes=0
+          - per_cluster_l0  (tuple of (n_st, ...))    in_axes=0
+          - pref            (tuple of (n_st, ...))    in_axes=0
+          - shared_layer0_patched, shared_mean_fn_patched
+            (tuples of (n_patches, ...))               in_axes=None
+          - scatter_sigma_patched ((n_patches,))       in_axes=None
+        Static-to-trace Python values (n_layers_stacked, n_points_stacked,
+        compute_stacked_cov, sigma_scatter_min) are closure-captured -- they
+        are part of the cache key, so a new wrapper is built whenever any
+        of them changes.
+        """
+        def _stacked_one(cpdf_wh, lnM, patch_idx_c,
+                          mfn_pc_tuple, l0_pc_tuple, pref_tuple,
+                          layer0_sr_patched, mean_fn_sr_shared_patched,
+                          scatter_sigma_patched):
+            l0_shared = tuple(p[patch_idx_c] for p in layer0_sr_patched)
+            mfn_shared = tuple(p[patch_idx_c]
+                                for p in mean_fn_sr_shared_patched)
+            scat_c = scatter_sigma_patched[patch_idx_c]
+
+            layer0_args = pref_tuple + l0_shared + l0_pc_tuple
+            mean_pref_args = pref_tuple
+            mean_sr_args = mfn_pc_tuple + mfn_shared
+            return stacked_kernel(cpdf_wh, lnM,
+                                   layer0_args, mean_pref_args, mean_sr_args,
+                                   scat_c, sigma_scatter_min,
+                                   n_points_stacked, compute_stacked_cov,
+                                   n_layers_stacked)
+
+        # JAX vmap with in_axes=0 on a tuple pytree applies axis 0 to every
+        # leaf; in_axes=None broadcasts the whole pytree.
+        in_axes = (0, 0, 0, 0, 0, 0, None, None, None)
+        return jax.jit(jax.vmap(_stacked_one, in_axes=in_axes))
+
     #Computes the stacked likelihood. Must be called after the unbinned likelihood has been computed.
 
     def get_log_lik_stacked(self):
@@ -2463,6 +2508,13 @@ class cluster_number_counts:
 
         sigma_scatter_min = jnp.float64(self.cnc_params["sigma_scatter_min"])
         n_points_stacked = int(self.cnc_params["n_points"])
+
+        # Wrappers (jit(vmap(_stacked_one))) are cached per stacked observable.
+        # Without caching, JAX retraces every MCMC step because the closure
+        # captures arrays whose identity changes with scal_rel_params, which
+        # blows the steady-state budget (measured ~1.7 s/step before this).
+        if not hasattr(self, "_stacked_wrappers"):
+            self._stacked_wrappers = {}
 
         # Build index map once (Python, outside JIT) using numpy to avoid GPU syncs
         bc_indices_np = np.asarray(self.bc_cluster_indices)
@@ -2505,7 +2557,9 @@ class cluster_number_counts:
                 self.logger.warning(f"No stacked kernel for {stacked_observable}, skipping")
                 continue
 
-            # Interpolate cosmology at stacked cluster redshifts
+            # Interpolate cosmology at stacked cluster redshifts. The "z" entry
+            # is the per-cluster redshift itself (passed-through prefactor for
+            # observables like shear_des_y3 whose layer 0 needs z_cluster).
             cosmo_at_st = {
                 "E_z": jax.vmap(lambda z: jnp.interp(z, self.redshift_vec, self.E_z))(z_st),
                 "H0": jnp.float64(H0),
@@ -2514,6 +2568,7 @@ class cluster_number_counts:
                 "D_l_CMB": jax.vmap(lambda z: jnp.interp(z, self.redshift_vec, self.D_l_CMB))(z_st),
                 "rho_c": jax.vmap(lambda z: jnp.interp(z, self.redshift_vec, self.rho_c))(z_st),
                 "gamma": jnp.float64(gamma_const),
+                "z": z_st,
             }
 
             # Compute prefactors for stacked observable
@@ -2530,8 +2585,37 @@ class cluster_number_counts:
             scatter_sigma_patched = jnp.broadcast_to(
                 jnp.float64(stacked_sr.get_scatter_sigma(self.scal_rel_params)),
                 (n_p,))
-            mean_fn_sr_patched = _tile_to_patches(
+            # Mean-fn SR args are split into a shared block (closure-captured,
+            # tiled per patch) and a per-cluster block (sliced by
+            # `stacked_cluster_indices` and passed via vmap in_axes=0).
+            # The mean_fn signature concatenates them: (..., *per_cluster_args,
+            # *shared_args, ...). See survey_sr_planck_szifi_jax.py for the
+            # contract.
+            mean_fn_sr_shared_patched = _tile_to_patches(
                 stacked_sr.get_mean_fn_sr_params(self.scal_rel_params), n_p)
+
+            st_idx_jax = jnp.asarray(stacked_cluster_indices)
+            if hasattr(stacked_sr, "get_mean_fn_sr_params_per_cluster"):
+                _mfn_pc_full = stacked_sr.get_mean_fn_sr_params_per_cluster(
+                    self.scal_rel_params)
+                mean_fn_sr_per_cluster = tuple(
+                    p[st_idx_jax] for p in _mfn_pc_full)
+            else:
+                mean_fn_sr_per_cluster = ()
+
+            # Layer-0 per-cluster SR params (only used when n_layers_stacked > 1).
+            # These were silently dropped before — see diary 2026-05-20.
+            if (n_layers_stacked > 1
+                    and hasattr(stacked_sr, "get_layer_sr_params_per_cluster")):
+                _l0_pc_full = stacked_sr.get_layer_sr_params_per_cluster(
+                    0, self.scal_rel_params)
+                layer0_sr_per_cluster = tuple(
+                    p[st_idx_jax] for p in _l0_pc_full)
+            else:
+                layer0_sr_per_cluster = ()
+
+            n_mfn_pc = len(mean_fn_sr_per_cluster)
+            n_l0_pc = len(layer0_sr_per_cluster)
 
             # Per-cluster patch indices for stacked observable
             if stacked_observable in self.catalogue.catalogue_patch:
@@ -2541,25 +2625,32 @@ class cluster_number_counts:
             else:
                 patch_st = jnp.zeros(n_clusters, dtype=jnp.int32)
 
-            # Per-cluster stacked kernel (vmapped), with patch indexing
-            def _stacked_one(cpdf_wh, lnM, patch_idx_c, *pref_vals):
-                l0_c = tuple(p[patch_idx_c] for p in layer0_sr_patched)
-                mfn_c = tuple(p[patch_idx_c] for p in mean_fn_sr_patched)
-                scat_c = scatter_sigma_patched[patch_idx_c]
-                layer0_args = pref_vals + l0_c
-                mean_pref_args = pref_vals
-                return stacked_kernel(cpdf_wh, lnM,
-                                       layer0_args, mean_pref_args, mfn_c,
-                                       scat_c, sigma_scatter_min,
-                                       n_points_stacked, compute_stacked_cov,
-                                       n_layers_stacked)
+            pref_st_flat = pref_st if isinstance(pref_st, tuple) else (pref_st,)
+            n_pref = len(pref_st_flat)
 
-            if isinstance(pref_st, tuple):
-                obs_means, obs_vars = jax.jit(jax.vmap(_stacked_one))(
-                    cpdf_st, lnM_st, patch_st, *pref_st)
-            else:
-                obs_means, obs_vars = jax.jit(jax.vmap(_stacked_one))(
-                    cpdf_st, lnM_st, patch_st, pref_st)
+            # Build the JIT'd vmap wrapper for this observable once and cache it.
+            # Per-step values (per-cluster arrays AND closure-replaced shared
+            # patched arrays) are passed as args, so the cache key is
+            # the stable abstract signature (shapes + dtypes). Per-MCMC
+            # parameter updates change array CONTENT but not signature, so the
+            # compiled XLA program is reused.
+            wrapper_key = (stacked_observable, n_mfn_pc, n_l0_pc, n_pref,
+                           n_layers_stacked, n_points_stacked,
+                           compute_stacked_cov)
+            wrapper = self._stacked_wrappers.get(wrapper_key)
+            if wrapper is None:
+                wrapper = self._build_stacked_wrapper(
+                    stacked_observable, stacked_kernel,
+                    n_mfn_pc, n_l0_pc, n_pref,
+                    n_layers_stacked, n_points_stacked, compute_stacked_cov,
+                    sigma_scatter_min)
+                self._stacked_wrappers[wrapper_key] = wrapper
+
+            obs_means, obs_vars = wrapper(
+                cpdf_st, lnM_st, patch_st,
+                mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
+                layer0_sr_patched, mean_fn_sr_shared_patched,
+                scatter_sigma_patched)
 
             # Aggregate
             stacked_model_vec = jnp.sum(obs_means, axis=0) / n_clusters
@@ -2567,16 +2658,21 @@ class cluster_number_counts:
 
             if compute_stacked_cov:
                 if stacked_var_vec.ndim == 0 or stacked_var_vec.size == 1:
-                    stacked_inv_cov = jnp.array([1. / stacked_var_vec.ravel()[0]])
+                    # 1x1 matrix so jnp.dot promotion gives a 0-D log-lik below.
+                    stacked_inv_cov = (1. / stacked_var_vec.ravel()[0]
+                                        ).reshape((1, 1))
                 else:
                     stacked_inv_cov = jnp.linalg.inv(jnp.diag(stacked_var_vec))
 
-            res = stacked_obs_vec - stacked_model_vec
+            # Promote scalar observables to (1,) so dot(res, dot(inv_cov, res))
+            # collapses to 0-D regardless of vector vs scalar observable.
+            res = jnp.atleast_1d(stacked_obs_vec - stacked_model_vec)
+            inv_cov_use = jnp.atleast_2d(stacked_inv_cov)
 
             self.stacked_model[stacked_data_label] = stacked_model_vec
             self.stacked_variance[stacked_data_label] = stacked_var_vec
 
-            log_lik = log_lik - 0.5 * jnp.dot(res, jnp.dot(stacked_inv_cov, res))
+            log_lik = log_lik - 0.5 * jnp.dot(res, jnp.dot(inv_cov_use, res))
 
         return log_lik
 
