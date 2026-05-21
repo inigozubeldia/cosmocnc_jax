@@ -2459,12 +2459,12 @@ class cluster_number_counts:
         on self._stacked_wrappers keyed by observable + shape ints.
 
         Pytree args:
-          - per_cluster_mfn (tuple of (n_st, ...))    in_axes=0
-          - per_cluster_l0  (tuple of (n_st, ...))    in_axes=0
-          - pref            (tuple of (n_st, ...))    in_axes=0
+          - per_cluster_mfn (tuple of (n_st, ...))            in_axes=0
+          - per_cluster_l0  (tuple of (n_st, ...))            in_axes=0
+          - pref            (tuple of (n_st, ...))            in_axes=0
           - shared_layer0_patched, shared_mean_fn_patched
-            (tuples of (n_patches, ...))               in_axes=None
-          - scatter_sigma_patched ((n_patches,))       in_axes=None
+            (tuples of (n_patches, ...))                       in_axes=None
+          - scatter_sigma_per_cluster ((n_st,))                in_axes=0
         Static-to-trace Python values (n_layers_stacked, n_points_stacked,
         compute_stacked_cov, sigma_scatter_min) are closure-captured -- they
         are part of the cache key, so a new wrapper is built whenever any
@@ -2473,24 +2473,30 @@ class cluster_number_counts:
         def _stacked_one(cpdf_wh, lnM, patch_idx_c,
                           mfn_pc_tuple, l0_pc_tuple, pref_tuple,
                           layer0_sr_patched, mean_fn_sr_shared_patched,
-                          scatter_sigma_patched):
+                          scatter_sigma_c):
             l0_shared = tuple(p[patch_idx_c] for p in layer0_sr_patched)
             mfn_shared = tuple(p[patch_idx_c]
                                 for p in mean_fn_sr_shared_patched)
-            scat_c = scatter_sigma_patched[patch_idx_c]
 
             layer0_args = pref_tuple + l0_shared + l0_pc_tuple
             mean_pref_args = pref_tuple
             mean_sr_args = mfn_pc_tuple + mfn_shared
             return stacked_kernel(cpdf_wh, lnM,
                                    layer0_args, mean_pref_args, mean_sr_args,
-                                   scat_c, sigma_scatter_min,
+                                   scatter_sigma_c, sigma_scatter_min,
                                    n_points_stacked, compute_stacked_cov,
                                    n_layers_stacked)
 
         # JAX vmap with in_axes=0 on a tuple pytree applies axis 0 to every
-        # leaf; in_axes=None broadcasts the whole pytree.
-        in_axes = (0, 0, 0, 0, 0, 0, None, None, None)
+        # leaf; in_axes=None broadcasts the whole pytree. scatter_sigma_c is
+        # now per-cluster (axis 0), enabling the stacked kernel to use the
+        # full per-cluster scatter model. The orchestrator builds the per-
+        # cluster σ via the established `self.scatter.get_cov(..., other_params=
+        # {"zc": z_st})` interface — same pattern as cosmocnc's stacked loop.
+        # For observables whose σ is z-independent, get_cov returns a scalar
+        # which the orchestrator broadcasts to (n_st,); for z-dependent ones
+        # (e.g. shear_des_y3), it returns the vector natively.
+        in_axes = (0, 0, 0, 0, 0, 0, None, None, 0)
         return jax.jit(jax.vmap(_stacked_one, in_axes=in_axes))
 
     #Computes the stacked likelihood. Must be called after the unbinned likelihood has been computed.
@@ -2578,13 +2584,10 @@ class cluster_number_counts:
             pref_vmap = jax.vmap(pref_fn, in_axes=pref_vmap_axes)
             pref_st = pref_vmap(*pref_args)
 
-            # Layer 0 SR params and scatter — tiled to (n_patches, ...) for patch indexing
+            # Layer 0 SR params — tiled to (n_patches, ...) for patch indexing
             n_p = self.n_patches
             layer0_sr_patched = _tile_to_patches(
                 stacked_sr.get_layer_sr_params(0, self.scal_rel_params), n_p)
-            scatter_sigma_patched = jnp.broadcast_to(
-                jnp.float64(stacked_sr.get_scatter_sigma(self.scal_rel_params)),
-                (n_p,))
             # Mean-fn SR args are split into a shared block (closure-captured,
             # tiled per patch) and a per-cluster block (sliced by
             # `stacked_cluster_indices` and passed via vmap in_axes=0).
@@ -2595,6 +2598,26 @@ class cluster_number_counts:
                 stacked_sr.get_mean_fn_sr_params(self.scal_rel_params), n_p)
 
             st_idx_jax = jnp.asarray(stacked_cluster_indices)
+
+            # Per-cluster scatter σ for the stacked kernel. Mirrors the cosmocnc
+            # NumPy pattern: the SR's `scatter.get_cov(obs, obs, layer=0,
+            # other_params={"zc": zc})` is the established generic interface and
+            # already returns a vector when σ is z-dependent (e.g. shear_des_y3
+            # via np.interp on s_wl_0..3) or a scalar otherwise (q_szifi,
+            # p_obs). We broadcast the scalar case to (n_clusters,) so the
+            # vmap'd kernel always sees a per-cluster scalar — no observable-
+            # specific dispatch in the core.
+            zc_st_np = np.asarray(z_st)
+            cov_per_cluster_np = np.asarray(self.scatter.get_cov(
+                observable1=stacked_observable,
+                observable2=stacked_observable,
+                layer=0,
+                other_params={"zc": zc_st_np},
+            ), dtype=np.float64)
+            scatter_sigma_per_cluster = jnp.asarray(
+                np.sqrt(np.broadcast_to(cov_per_cluster_np, (n_clusters,))),
+                dtype=jnp.float64)
+
             if hasattr(stacked_sr, "get_mean_fn_sr_params_per_cluster"):
                 _mfn_pc_full = stacked_sr.get_mean_fn_sr_params_per_cluster(
                     self.scal_rel_params)
@@ -2650,7 +2673,7 @@ class cluster_number_counts:
                 cpdf_st, lnM_st, patch_st,
                 mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
                 layer0_sr_patched, mean_fn_sr_shared_patched,
-                scatter_sigma_patched)
+                scatter_sigma_per_cluster)
 
             # Aggregate
             stacked_model_vec = jnp.sum(obs_means, axis=0) / n_clusters
