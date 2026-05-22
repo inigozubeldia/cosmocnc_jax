@@ -2675,6 +2675,22 @@ class cluster_number_counts:
                 layer0_sr_patched, mean_fn_sr_shared_patched,
                 scatter_sigma_per_cluster)
 
+            # Per-cluster predictions (shape (n_stacked_clusters, *obs_shape))
+            # are saved so external diagnostics can stratify the stacked
+            # residual by cluster z / q / patch without re-deriving them.
+            # Aggregated quantities (stacked_model, stacked_variance) are
+            # already exposed below.
+            if not hasattr(self, "stacked_per_cluster_model"):
+                self.stacked_per_cluster_model = {}
+                self.stacked_per_cluster_variance = {}
+                self.stacked_cluster_indices = {}
+                self.stacked_cluster_z = {}
+            self.stacked_per_cluster_model[stacked_data_label] = obs_means
+            self.stacked_per_cluster_variance[stacked_data_label] = obs_vars
+            self.stacked_cluster_indices[stacked_data_label] = np.asarray(
+                stacked_cluster_indices)
+            self.stacked_cluster_z[stacked_data_label] = np.asarray(z_st)
+
             # Aggregate
             stacked_model_vec = jnp.sum(obs_means, axis=0) / n_clusters
             stacked_var_vec = jnp.sum(obs_vars, axis=0) / n_clusters**2
