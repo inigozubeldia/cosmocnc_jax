@@ -466,60 +466,10 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
 
 
-def build_backward_conv_1d(layer0_fn, layer1_fn, layer0_returns_aux=False):
-    """Factory: build a generic 1D 2-layer backward conv function.
-
-    Args:
-        layer0_fn: pure JAX layer-0 function. If layer0_returns_aux,
-                   returns (x1, aux); otherwise returns x1.
-        layer1_fn: pure JAX layer-1 function. Returns x1.
-        layer0_returns_aux: whether layer0 returns (x1, aux).
-
-    Returns:
-        backward_conv_1d(lnM, obs_val, layer0_args, layer1_args,
-                          sigma_scatter_0, n_points, apply_cutoff, cutoff_val)
-        where layer0_args = prefactors + layer_sr_params (tuple)
-              layer1_args = layer_sr_params (tuple, may be empty)
-    """
-    def backward_conv_1d(lnM, obs_val, layer0_args, layer1_args,
-                          sigma_scatter_0, n_points, apply_cutoff, cutoff_val):
-        # Forward through layer 0
-        if layer0_returns_aux:
-            x_l0, _aux = layer0_fn(lnM, *layer0_args)
-        else:
-            x_l0 = layer0_fn(lnM, *layer0_args)
-
-        x_l0_min = x_l0[0]
-        x_l0_max = x_l0[-1]
-        x_l0_linear = jnp.linspace(x_l0_min, x_l0_max, n_points)
-
-        # Evaluate layer 1 on linear grid
-        if len(layer1_args) > 0:
-            x_l1 = layer1_fn(x_l0_linear, *layer1_args)
-        else:
-            x_l1 = layer1_fn(x_l0_linear)
-        residual = x_l1 - obs_val
-
-        # Gaussian PDF (layer-1 scatter = 1)
-        cpdf = gaussian_1d(residual, 1.0)
-
-        # Observable cutoff
-        cpdf = jnp.where(apply_cutoff & (x_l1 < cutoff_val), 0., cpdf)
-
-        # Layer-0 convolution kernel
-        dx = x_l0_linear[1] - x_l0_linear[0]
-        x_kernel = x_l0_linear - jnp.mean(x_l0_linear) + 0.5 * dx
-        kernel = gaussian_1d(x_kernel, jnp.maximum(sigma_scatter_0, 1e-30))
-        cpdf_conv = convolve_nd(cpdf, kernel)
-        cpdf = jnp.where(sigma_scatter_0 > 1e-10, cpdf_conv, cpdf)
-
-        cpdf = jnp.maximum(cpdf, 0.)
-
-        # Interpolate back to original (SR-distorted) grid
-        cpdf = interp_uniform(x_l0, x_l0_min, x_l0_max, n_points, cpdf)
-        return cpdf
-
-    return backward_conv_1d
+# [removed 2026-06-02] build_backward_conv_1d was dead code: it was built into
+# self._bc_fns at initialise() but never invoked. The live data-likelihood path
+# is build_backward_conv_nd (n_obs==1 reduces to the same 1D algorithm there).
+# Removed per the 2026-06-02 data-integration audit.
 
 
 def build_mass_range_fn(layer0_fn, layer0_deriv_fn, layer1_fn, layer1_deriv_fn,
@@ -862,7 +812,6 @@ class cluster_number_counts:
         # ── 1. Backward conv functions per correlation set ──
         # _bc_set_fns: list of (bc_fn, obs_names_in_set) per correlation set
         # _bc_obs_list: flat list of all backward-conv observable names (for data gathering)
-        self._bc_fns = {}          # per-observable 1D backward conv (kept for compatibility)
         self._bc_obs_list = []     # flat list of all bc observable names
         self._bc_set_fns = []      # list of (bc_fn, obs_names) per correlation set
         self._bc_set_obs = []      # list of obs_name lists per correlation set
@@ -909,13 +858,6 @@ class cluster_number_counts:
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
 
-            # Also build per-observable 1D fns (for legacy/compatibility)
-            for obs_name in bc_obs_in_set:
-                if obs_name not in self._bc_fns:
-                    sr = self.scaling_relations[obs_name]
-                    self._bc_fns[obs_name] = build_backward_conv_1d(
-                        sr.get_layer_fn(0), sr.get_layer_fn(1),
-                        layer0_returns_aux=sr.get_layer_returns_aux(0))
 
         # ── 2. Mass range function for selection observable ──
         layer0_fn_sel = sr_sel.get_layer_fn(0)
