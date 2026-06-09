@@ -163,6 +163,7 @@ scal_rel_params_ref = {
 "alpha_szifi":1.1233,#1233, #1.1233 ?
 "A_szifi": -4.3054, #Arnaud values, respectively
 "sigma_lnq_szifi": 0.173,
+"beta_szifi": 2.0, #E(z) exponent of the SZ y0 amplitude; self-similar value 2 (fixed by hand by default)
 
 #SPT
 # spt style lkl:
@@ -219,6 +220,7 @@ scaling_relation_params_default = {
 "alpha_szifi":1.1233, #1.1233 ? True value in synthetic catalogues is 1.1233, for some reason
 "A_szifi": -4.3054, #Arnaud values, respectively
 "sigma_lnq_szifi": 0.173,
+"beta_szifi": 2.0, #E(z) exponent of the SZ y0 amplitude; self-similar value 2 (fixed by hand by default)
 
 #SPT
 # spt style lkl:

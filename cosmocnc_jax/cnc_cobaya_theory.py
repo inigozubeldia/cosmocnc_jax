@@ -408,6 +408,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"alpha_szifi")
         assign_parameter_value(scal_rel_params,params_values,"A_szifi")
         assign_parameter_value(scal_rel_params,params_values,"sigma_lnq_szifi")
+        assign_parameter_value(scal_rel_params,params_values,"beta_szifi")
 
         # DES Y3 WL — 10-parameter Magneticum B13 calibration (joint Gaussian
         # prior from wl_prior_magneticum_4sigma_trim.npz; see CLAUDE.md).
