@@ -40,9 +40,65 @@ class cnc_likelihood(Likelihood):
 
         _derived = params_values.pop("_derived", None)
         theory = self._get_theory(**params_values)
-        loglkl = theory
+        # cnc.get_log_lik() (classy_sz_jax path) returns a 0-d JAX array; Cobaya's
+        # current_logp does value[0] on anything with __len__, which a 0-d JAX
+        # array has (and indexing it raises). Return a plain Python float.
+        loglkl = float(theory)
 
         return loglkl
+
+
+class joint_gaussian_prior(Likelihood):
+    """Joint multivariate-Gaussian prior on a set of sampled parameters.
+
+    Reads `prior_file` (an .npz holding `mean` (n,) and `cov` (n,n)) and adds
+    the log-prior  -0.5 (theta - mean)^T cov^-1 (theta - mean)  over the
+    parameters listed in `params_order`, IN THAT ORDER -- which MUST match the
+    mean/cov ordering stored in the npz. Generic (data-driven), so one class
+    serves multiple priors; instantiate it more than once in the YAML via the
+    `class:` key. Mirrors the so_cmb_prior_* / desi_prior_* classes below.
+
+    Used by the Planck SZiFi project for:
+      - DES Y3 WL 10-D Magneticum prior  (wl_prior_magneticum_4sigma_trim.npz)
+      - CMB-lensing 3-D generic-bias prior (cmblensing_prior_magneticum_corr.npz)
+    """
+
+    prior_file: Optional[str] = None
+    params_order: Optional[Sequence] = None
+
+    def initialize(self):
+
+        if self.prior_file is None or self.params_order is None:
+            raise ValueError(
+                "joint_gaussian_prior requires both 'prior_file' and "
+                "'params_order' to be set in the YAML.")
+
+        data = np.load(self.prior_file, allow_pickle=True)
+        self.mean = np.asarray(data["mean"], dtype=float)
+        cov = np.asarray(data["cov"], dtype=float)
+        self._params = list(self.params_order)
+
+        n = len(self._params)
+        if self.mean.shape != (n,) or cov.shape != (n, n):
+            raise ValueError(
+                f"joint_gaussian_prior: params_order has {n} entries but "
+                f"'{self.prior_file}' stores mean {self.mean.shape}, "
+                f"cov {cov.shape}.")
+
+        self.inv_cov = np.linalg.inv(cov)
+        self.log.info(
+            f"joint_gaussian_prior on {self._params} from {self.prior_file}")
+
+    def get_requirements(self):
+
+        return {p: None for p in self._params}
+
+    def logp(self, **params_values):
+
+        theta = np.array([self.provider.get_param(p) for p in self._params])
+        res = theta - self.mean
+
+        return -0.5 * float(res @ self.inv_cov @ res)
 
 
 class so_cmb_prior_wcdm(Likelihood): #warning: h as input instead of H0

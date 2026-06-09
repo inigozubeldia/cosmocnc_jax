@@ -7,6 +7,57 @@ import os
 import numpy as np
 from .utils import *
 
+# Complete list of cnc_params this Cobaya theory passes to cnc.cnc_params.
+# Every key here MUST be a declared class attribute of `cnc` below, and the
+# Cobaya YAML is expected to pin every one of them explicitly (from the project
+# baseline, cosmocnc_params_baseline_jax.py). Keeping this list complete is what
+# guarantees no parameter is silently dropped: if a cnc_param is added to
+# cosmocnc_jax/params.py, add it here (and declare it below) too.
+_CNC_PARAM_KEYS = (
+    # paths
+    "survey_sr", "survey_cat",
+    # cores / parallelism
+    "number_cores_hmf", "number_cores_abundance", "number_cores_data",
+    "number_cores_stacked", "parallelise_type",
+    # precision
+    "n_points", "n_obs_select", "n_z", "n_points_data_lik", "sigma_mass_prior",
+    "downsample_hmf_bc", "padding_fraction", "pad_abundance", "bc_chunk_size",
+    "nd_convolution_mode",
+    # observables / catalogue
+    "load_catalogue", "precompute_cnc_quantities_catalogue", "likelihood_type",
+    "obs_select", "observables", "observables_mass_estimation", "cluster_catalogue",
+    "data_lik_from_abundance", "data_lik_type", "abundance_integral_type",
+    "compute_abundance_matrix", "catalogue_params", "apply_obs_cutoff",
+    "delta_m_with_ref",   # NB: get_masses handled separately (Cobaya reserves get_*)
+    # ranges
+    "obs_select_min", "obs_select_max", "z_min", "z_max",
+    # cosmology / hmf
+    "cosmology_tool", "M_min", "M_max", "M_min_extended", "M_min_cutoff",
+    "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv",
+    "power_spectrum_type", "cosmo_amplitude_parameter", "cosmo_param_density",
+    "scalrel_type_deriv", "sigma_scatter_min", "interp_tinker", "Hubble_parameter",
+    "cosmo_model", "class_sz_ndim_masses", "class_sz_concentration_parameter",
+    "class_sz_output", "class_sz_hmf", "class_sz_use_m500c_in_ym_relation",
+    "class_sz_use_m200c_in_ym_relation",
+    # redshift errors
+    "z_errors", "n_z_error_integral", "z_error_sigma_integral_range",
+    "z_error_min", "z_bounds", "convolve_nz", "sigma_nz",
+    # false detections
+    "non_validated_clusters",
+    # binned likelihood
+    "binned_lik_type", "bins_edges_z", "bins_edges_obs_select",
+    # stacked likelihood
+    "stacked_likelihood", "stacked_data", "compute_stacked_cov",
+    # alternative calibration likelihood
+    "likelihood_cal_alt", "observables_cal_alt",
+    # simulator
+    "cov_constant", "observable_vectorised", "observable_vector",
+    # SZ matched filter (also mirrored into scal_rel_params in calculate())
+    "dof", "q_cutoff",
+    # priors / verbose
+    "priors", "theta_mc_prior", "cosmocnc_verbose",
+)
+
 class cnc(classy):
 
     survey_sr : Optional[str] =  "none"
@@ -114,7 +165,35 @@ class cnc(classy):
     class_sz_concentration_parameter: Optional[str] = "B13"
     class_sz_hmf: Optional[str] = "T08M500c"
     class_sz_output: Optional[str] = "m500c_to_m200c"
+    class_sz_use_m500c_in_ym_relation: Optional[int] = 1
+    class_sz_use_m200c_in_ym_relation: Optional[int] = 0
 
+    # Additional cnc_params (declared so they can be pinned from the YAML and
+    # passed through to cnc.cnc_params; defaults below mirror the GENERIC
+    # cosmocnc_jax/params.py -- this is a shared library file, so it must not
+    # bake in project-baseline values. The YAML is expected to set ALL cnc_params
+    # explicitly from the project baseline -- see cosmocnc_params_baseline_jax.py).
+    # (n_z_error_integral / z_error_* / stacked_data / compute_stacked_cov are
+    #  already declared above; not repeated here.)
+    pad_abundance: Optional[bool] = False
+    bc_chunk_size: Optional[int] = 2000
+    nd_convolution_mode: Optional[str] = "linear"
+    load_catalogue: Optional[bool] = True
+    precompute_cnc_quantities_catalogue: Optional[bool] = True
+    # `compute_masses` is the Cobaya-facing name for cnc_params["get_masses"];
+    # it is mapped in initialize(). Renamed because Cobaya reserves the get_*
+    # prefix for provider methods, so a literal `get_masses` option breaks
+    # component introspection (getfullargspec on a bool).
+    compute_masses: Optional[bool] = False
+    M_min_extended: Optional[float] = None
+    M_min_cutoff: Optional[float] = None
+    z_bounds: Optional[bool] = False
+    convolve_nz: Optional[bool] = False
+    sigma_nz: Optional[float] = 0.
+    non_validated_clusters: Optional[bool] = False
+    cov_constant: Optional[dict] = None
+    observable_vectorised: Optional[object] = True
+    observable_vector: Optional[object] = False
 
     # verbose parameter
     cosmocnc_verbose: Optional[str] = "none"
@@ -237,6 +316,29 @@ class cnc(classy):
         # verbose paramater
         self.cnc.cnc_params["cosmocnc_verbose"] = self.cosmocnc_verbose
 
+        # --- Completeness sweep (2026-06-09) --------------------------------
+        # The explicit assignments above are a SUBSET. This loop passes EVERY
+        # declared cnc_param to cnc.cnc_params so none is silently dropped: it
+        # also covers the JAX/sim params (pad_abundance, bc_chunk_size,
+        # nd_convolution_mode, cov_constant, observable_vectorised/_vector,
+        # load_catalogue, get_masses, M_min_extended/_cutoff, z_bounds,
+        # convolve_nz/sigma_nz, non_validated_clusters,
+        # class_sz_use_m{2,5}00c_in_ym_relation) AND priors/theta_mc_prior, which
+        # the block above did not set. The YAML pins all of these from the
+        # project baseline (cosmocnc_params_baseline_jax.py); see _CNC_PARAM_KEYS.
+        for _key in _CNC_PARAM_KEYS:
+            self.cnc.cnc_params[_key] = getattr(self, _key)
+        # restore int/float types for the shape/size params
+        for _key in ("n_points", "n_obs_select", "n_z", "downsample_hmf_bc",
+                     "n_points_data_lik", "bc_chunk_size", "n_z_error_integral"):
+            self.cnc.cnc_params[_key] = int(self.cnc.cnc_params[_key])
+        for _key in ("M_min", "M_max"):
+            self.cnc.cnc_params[_key] = float(self.cnc.cnc_params[_key])
+        # get_masses: exposed in the YAML as `compute_masses` (Cobaya reserves
+        # the get_* prefix for provider methods) and mapped here.
+        self.cnc.cnc_params["get_masses"] = self.compute_masses
+        # --------------------------------------------------------------------
+
         super(classy,self).initialize()
         self.extra_args["output"] = self.extra_args.get("output","")
         # print(self.extra_args)
@@ -319,6 +421,13 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"s_wl_1")
         assign_parameter_value(scal_rel_params,params_values,"s_wl_2")
         assign_parameter_value(scal_rel_params,params_values,"s_wl_3")
+
+        # CMB lensing — generic per-cluster bias nuisances (3-D joint Gaussian
+        # prior from cmblensing_prior_magneticum_corr.npz) + overall amplitude.
+        assign_parameter_value(scal_rel_params,params_values,"a_beta_generic")
+        assign_parameter_value(scal_rel_params,params_values,"alpha_beta_generic")
+        assign_parameter_value(scal_rel_params,params_values,"beta_beta_generic")
+        assign_parameter_value(scal_rel_params,params_values,"cmblensing_bias_simple")
 
         # SPT-style parameters:
 
