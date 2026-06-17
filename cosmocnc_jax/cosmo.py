@@ -10,6 +10,31 @@ from .hmf import *
 import time
 
 
+# ---- theta_MC helper: universal massive-neutrino energy-density ratio g(y) = rho(y)/rho_massless ----
+# Used by get_theta_mc to reproduce CAMB cosmomc_theta with the exact massive-neutrino background
+# (y = a * m_nu / T_nu0). Cosmology-independent, so tabulated once at import (numpy, no scipy).
+# See planck_cosmology/verify_theta_mc_analytic.py for the validation.
+_THETA_T_CMB_K = 2.7255                                            # consistent with Ogamma0 = 2.47282e-5
+_THETA_T_NU0_EV = (4. / 11.)**(1. / 3.) * _THETA_T_CMB_K * 8.617333262e-5
+
+
+def _theta_build_g_table():
+    q = np.linspace(0., 80., 4000)
+    fd = q**3 / (np.exp(q) + 1.)
+    den = np.trapezoid(fd, q)                                     # = 7 pi^4 / 120
+    y_tab = np.concatenate([[0.], np.geomspace(1e-5, 1e4, 600)])
+    g_tab = np.array([np.trapezoid(q**2 * np.sqrt(q**2 + y**2) / (np.exp(q) + 1.), q) / den
+                      for y in y_tab])
+    return y_tab, g_tab
+
+
+_THETA_Y_TAB, _THETA_G_TAB = _theta_build_g_table()
+
+
+def _theta_g_of_y(y):
+    return np.interp(y, _THETA_Y_TAB, _THETA_G_TAB)
+
+
 # hmfast emulator_set name for each cosmocnc cosmo_model.
 _HMFAST_EMU_FOR_MODEL = {
     "lcdm": "lcdm:v1",
@@ -786,21 +811,61 @@ class cosmology_model:
 
     def get_theta_mc(self):
 
-        Ogamma0 = 2.47282*10.**(-5)/self.cosmo_params["h"]**2
-        Orad0 =  4.18343*10.**(-5)/self.cosmo_params["h"]**2
-        Om0 = self.cosmo_params["Om0"]
-        Ob0 = self.cosmo_params["Ob0"]
-        OL0 = 1.-Om0-Orad0
+        # Reproduces CAMB's CAMBdata_CosmomcTheta (the CosmoMC theta_MC Planck reports), so the
+        # Planck 100*theta_MC constraint can be used directly as a prior. PURE-ANALYTIC and
+        # current-cosmology: JAX update_cosmology does NOT re-run compute_class_szfast(), so
+        # self.classy is STALE -- this method uses only cosmo_params + the der-emulator-derived
+        # z_CMB/D_CMB (both current), never the stale classy background. Not on the JIT hot path
+        # (a once-per-step derived parameter), so plain numpy quadrature is fine.
+        #   zstar : Hu & Sugiyama, total-matter base (omch2+omnuh2+ombh2)
+        #   rs    : int_{1e-8}^{astar} da/(a^2 (H/c) sqrt(3(1+R))), R = 3e4 a ombh2 (CAMB dsound_da_approx),
+        #           H(a) analytic with the exact massive-nu density via the universal g(y) table
+        #   D_C   : ra_rec (der emulator, current) + analytic high-z correction z_rec->zstar
+        # Verified vs camb.cosmomc_theta() to ~1.5e-5 and vs the NumPy classy-H method to ~1.7e-5
+        # (planck_cosmology/verify_theta_mc_analytic.py).
 
-        a_cmb = 1./(1.+self.z_CMB)
+        h = self.cosmo_params["h"]
+        H0_over_c = (h*100.)/(constants().c_light/1e3)            # H0/c in 1/Mpc
 
-        # JAX trapezoid quadrature (replaces scipy.integrate.quad)
-        x_quad = jnp.linspace(0., a_cmb, 500)
-        integrand = 1./jnp.sqrt((1.+3.*Ob0*x_quad/(4.*Ogamma0))*(OL0*x_quad**4+Om0*x_quad+Orad0))
-        r_sound = jnp.trapezoid(integrand, x_quad)/(self.cosmo_params["h"]*100.*jnp.sqrt(3.))*constants().c_light/1e3/self.z_CMB
-        theta_mc = r_sound/self.D_CMB
+        ombh2 = self.cosmo_params["Ob0"]*h**2
+        omch2 = self.cosmo_params["Om0"]*h**2 - ombh2            # Om0 excludes neutrinos
+        m_nu = self.cosmo_params.get("m_nu", 0.06)
+        omnuh2 = m_nu/93.14                                       # CAMB-style massive-neutrino density
+        om_tot_h2 = omch2 + ombh2 + omnuh2                       # CAMB: omch2 + omnuh2 + ombh2
 
-        return theta_mc
+        Orad0 = 4.18343e-5/h**2                                   # gamma + all-nu-as-radiation (N_eff=3.046)
+        Onu0 = omnuh2/h**2
+        Ocb = self.cosmo_params["Om0"]                           # cdm + baryon (matches grhoc+grhob)
+        y0 = m_nu/_THETA_T_NU0_EV
+        Om_massive_rel = Onu0/_theta_g_of_y(y0)                  # relativistic-equivalent of the massive species
+        Ogamma_massless = Orad0 - Om_massive_rel                 # photons + massless neutrinos
+        OL0 = 1. - Ocb - Ogamma_massless - Onu0                  # closes a=1; DE negligible at the z's that matter
+
+        # Hu & Sugiyama (1996) z_star, exactly as in CAMB CosmomcTheta
+        g1 = 0.0783*ombh2**(-0.238)/(1.+39.5*ombh2**0.763)
+        g2 = 0.560/(1.+21.1*ombh2**1.81)
+        z_star = 1048.*(1.+0.00124*ombh2**(-0.738))*(1.+g1*om_tot_h2**g2)
+        a_star = 1./(1.+z_star)
+
+        def H_over_c(a):
+            E2 = Ocb*a**-3 + Ogamma_massless*a**-4 + Om_massive_rel*_theta_g_of_y(a*y0)*a**-4 + OL0
+            return H0_over_c*np.sqrt(E2)
+
+        # comoving sound horizon to z_star (CAMB dsound_da_approx: R = 3e4 a ombh2)
+        a_rs = np.linspace(1e-8, a_star, 4000)
+        rs_int = 1./(a_rs**2*H_over_c(a_rs)*np.sqrt(3.*(1.+3.0e4*a_rs*ombh2)))
+        r_sound = np.trapezoid(rs_int, a_rs)
+
+        # comoving (radial) distance to z_star = ra_rec (current, der emulator) + analytic high-z correction
+        ra_rec = self.D_CMB*(1.+self.z_CMB)                     # D_CMB = da_rec = ra_rec/(1+z_rec)
+        a_zrec = 1./(1.+self.z_CMB)
+        a_corr = np.linspace(a_star, a_zrec, 500)
+        DC_corr = np.trapezoid(1./(a_corr**2*H_over_c(a_corr)), a_corr)
+        D_comoving = ra_rec + DC_corr
+
+        theta_mc = r_sound/D_comoving
+
+        return float(theta_mc)
 
     def get_z_cmb(self):
 
