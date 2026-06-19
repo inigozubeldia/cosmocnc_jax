@@ -541,7 +541,7 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
                         layer0_args, mean_fn_pref_args, mean_fn_sr_args,
                         sigma_scatter_0, sigma_scatter_min,
                         n_points_stacked, compute_stacked_cov,
-                        n_layers_stacked):
+                        n_layers_stacked, compute_full_cov=False):
         # Normalise cpdf
         norm = simpson(cpdf_with_hmf, x=lnM)
         cpdf = cpdf_with_hmf / jnp.maximum(norm, 1e-300)
@@ -572,9 +572,12 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
             sigma_intrinsic = sigma_scatter_0
 
         # mean_fn signature: (x0, *pref_args, *sr_args, sigma_intrinsic, compute_var=...)
+        # compute_var is forced on when the full covariance is requested, since
+        # the per-component measurement-noise variance (var_vec) is the diagonal
+        # part of the full Σ.
         mean_vec, var_vec = mean_fn(
             x0, *mean_fn_pref_args, *mean_fn_sr_args,
-            sigma_intrinsic, compute_var=compute_stacked_cov)
+            sigma_intrinsic, compute_var=(compute_stacked_cov or compute_full_cov))
 
         # Support scalar (n_mass,) and vector (n_mass, K, ...) observables:
         # broadcast cpdf to mean_vec's rank, integrate along the mass axis (0).
@@ -584,6 +587,36 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
         obs_mean = simpson(mean_vec * cpdf_b, x=x0, axis=0)
         obs_second_moment = simpson((var_vec + mean_vec**2) * cpdf_b, x=x0, axis=0)
         obs_var = obs_second_moment - obs_mean**2
+
+        if compute_full_cov:
+            # Full covariance ACROSS the vector components, including the
+            # coherent WL-mass-scatter correlation that the per-component
+            # `obs_var` (diagonal) drops. The per-cluster mass posterior `cpdf`
+            # already carries the layer-0 (e.g. s_wl) scatter, and a single
+            # scalar mass fluctuation moves all radial bins together through the
+            # NFW M-dependence of g(r;M). Hence the mass part is the full
+            # second-moment outer product:
+            #     Σ_mass(i,j) = E_cpdf[g_i g_j] − E[g_i] E[g_j]      (off-diag ≠ 0)
+            # The measurement noise (var_vec) is independent per component, so it
+            # contributes ONLY to the diagonal:
+            #     Σ(i,j) = Σ_mass(i,j) + δ_ij · E_cpdf[var_vec_i].
+            # By construction diag(Σ) == obs_var to machine precision (the
+            # regression invariant the verification test checks). Generic over
+            # scalar (K=1 → 1×1) and vector (K>1) observables.
+            mv = mean_vec.reshape(mean_vec.shape[0], -1)             # (n_mass, K)
+            # var_vec may be a 0-d scalar (e.g. p_sim's measurement variance is a
+            # scalar jnp.where, survey_sr_..._jax.py:379); broadcast to mean_vec's
+            # shape first — exactly as the diagonal `var_vec + mean_vec**2` above —
+            # so the (n_mass, K) reshape is valid for scalar and vector observables.
+            vv = jnp.broadcast_to(var_vec, mean_vec.shape).reshape(mean_vec.shape[0], -1)
+            cpdf_1 = cpdf.reshape(cpdf.shape[0], 1)                  # (n_mass, 1)
+            E_gg = simpson(mv[:, :, None] * mv[:, None, :] * cpdf_1[:, :, None],
+                           x=x0, axis=0)                            # (K, K)  E[g_i g_j]
+            mean_flat = obs_mean.reshape(-1)                         # (K,)
+            cov_mass = E_gg - mean_flat[:, None] * mean_flat[None, :]
+            E_meas = simpson(vv * cpdf_1, x=x0, axis=0)              # (K,)  E[var_meas_i]
+            obs_cov = cov_mass + jnp.diag(E_meas)                    # (K, K)
+            return obs_mean, obs_var, obs_cov
 
         return obs_mean, obs_var
 
@@ -715,6 +748,16 @@ class cluster_number_counts:
 
         set_verbosity(self.cnc_params["cosmocnc_verbose"])
         self.logger = logging.getLogger(__name__)
+
+        # Resolve the FFT path once. "exact" (default) keeps the GPU/CPU f64 FFT
+        # + mcfit FFTLog unchanged. "tpu" selects the TPU-compatible path
+        # (complex64 convolutions + FFT-free direct-quadrature sigma(R)), since
+        # TPU XLA cannot lower the f64->complex128 FFT. "auto" picks by backend.
+        _fft_mode = self.cnc_params.get("fft_mode", "exact")
+        if _fft_mode == "auto":
+            _fft_mode = "tpu" if jax.default_backend() == "tpu" else "exact"
+        self.cnc_params["fft_mode"] = _fft_mode
+        set_fft_c64(_fft_mode == "tpu")
 
         # Load the survey data
 
@@ -1519,20 +1562,28 @@ class cluster_number_counts:
                     Delta_vec = jnp.array(Delta_list)
                     volume_element_vec = jnp.array(vol_list)
 
-                # Create TophatVar objects and cached vmap functions once (reuse across MCMC iterations)
-                from mcfit import TophatVar
-                if not hasattr(self, '_tv0'):
-                    self._tv0 = TophatVar(np.asarray(k_arr), lowring=True, deriv=0, backend='jax')
-                    self._tv1 = TophatVar(np.asarray(k_arr), lowring=True, deriv=1, backend='jax')
-                    self._batch_sigma_fns = build_batch_sigma_fns(
-                        self._tv0, self._tv1, k_arr,
+                if self.cnc_params.get("fft_mode", "exact") == "tpu":
+                    # TPU path: FFT-free direct-quadrature sigma(R). The mcfit
+                    # FFTLog forces complex128 and cannot lower on TPU.
+                    sigma_matrix, dsigma_matrix, R_matrix = batch_sigma_R_direct(
+                        k_arr, pk_batch, M_vec, rho_m,
                         type_deriv=self.cnc_params["hmf_type_deriv"])
+                else:
+                    # Default GPU/CPU path: exact mcfit FFTLog (unchanged).
+                    # Create TophatVar objects and cached vmap functions once (reuse across MCMC iterations)
+                    from mcfit import TophatVar
+                    if not hasattr(self, '_tv0'):
+                        self._tv0 = TophatVar(np.asarray(k_arr), lowring=True, deriv=0, backend='jax')
+                        self._tv1 = TophatVar(np.asarray(k_arr), lowring=True, deriv=1, backend='jax')
+                        self._batch_sigma_fns = build_batch_sigma_fns(
+                            self._tv0, self._tv1, k_arr,
+                            type_deriv=self.cnc_params["hmf_type_deriv"])
 
-                # Batch compute sigma(M) and dsigma/dR(M) via cached vmapped FFTLog
-                sigma_matrix, dsigma_matrix, R_matrix = batch_sigma_R_from_tophat(
-                    self._tv0, self._tv1, pk_batch, k_arr, M_vec, rho_m,
-                    type_deriv=self.cnc_params["hmf_type_deriv"],
-                    _cached_fns=self._batch_sigma_fns)
+                    # Batch compute sigma(M) and dsigma/dR(M) via cached vmapped FFTLog
+                    sigma_matrix, dsigma_matrix, R_matrix = batch_sigma_R_from_tophat(
+                        self._tv0, self._tv1, pk_batch, k_arr, M_vec, rho_m,
+                        type_deriv=self.cnc_params["hmf_type_deriv"],
+                        _cached_fns=self._batch_sigma_fns)
 
                 # Use interp_tinker setting to choose parameter grid
                 interp_log = (self.cnc_params["interp_tinker"] == "log")
@@ -2393,7 +2444,8 @@ class cluster_number_counts:
     def _build_stacked_wrapper(self, stacked_observable, stacked_kernel,
                                 n_mfn_pc, n_l0_pc, n_pref,
                                 n_layers_stacked, n_points_stacked,
-                                compute_stacked_cov, sigma_scatter_min):
+                                compute_stacked_cov, sigma_scatter_min,
+                                compute_full_cov=False):
         """Build a jit(vmap(_stacked_one)) wrapper for one stacked observable.
 
         All per-MCMC-step values are passed as arguments (not closure) so
@@ -2427,7 +2479,7 @@ class cluster_number_counts:
                                    layer0_args, mean_pref_args, mean_sr_args,
                                    scatter_sigma_c, sigma_scatter_min,
                                    n_points_stacked, compute_stacked_cov,
-                                   n_layers_stacked)
+                                   n_layers_stacked, compute_full_cov)
 
         # JAX vmap with in_axes=0 on a tuple pytree applies axis 0 to every
         # leaf; in_axes=None broadcasts the whole pytree. scatter_sigma_c is
@@ -2450,9 +2502,17 @@ class cluster_number_counts:
         H0 = self.cosmology.background_cosmology.H0.value
         gamma_const = constants().gamma
         compute_stacked_cov = bool(self.cnc_params["compute_stacked_cov"])
+        # Gated full covariance (default off → hot MCMC path byte-identical).
+        # When on, the stacked kernel additionally returns the FULL Σ across
+        # vector components — i.e. the coherent WL-mass-scatter correlation that
+        # the diagonal `stacked_variance` collapses away — which is exposed as
+        # self.stacked_covariance and used (full-matrix inverse) in the stacked
+        # χ². See build_stacked_kernel for the covariance construction.
+        compute_full_cov = bool(self.cnc_params.get("stacked_full_cov", False))
 
         self.stacked_model = {}
         self.stacked_variance = {}
+        self.stacked_covariance = {}
 
         sigma_scatter_min = jnp.float64(self.cnc_params["sigma_scatter_min"])
         n_points_stacked = int(self.cnc_params["n_points"])
@@ -2601,21 +2661,30 @@ class cluster_number_counts:
             # compiled XLA program is reused.
             wrapper_key = (stacked_observable, n_mfn_pc, n_l0_pc, n_pref,
                            n_layers_stacked, n_points_stacked,
-                           compute_stacked_cov)
+                           compute_stacked_cov, compute_full_cov)
             wrapper = self._stacked_wrappers.get(wrapper_key)
             if wrapper is None:
                 wrapper = self._build_stacked_wrapper(
                     stacked_observable, stacked_kernel,
                     n_mfn_pc, n_l0_pc, n_pref,
                     n_layers_stacked, n_points_stacked, compute_stacked_cov,
-                    sigma_scatter_min)
+                    sigma_scatter_min, compute_full_cov)
                 self._stacked_wrappers[wrapper_key] = wrapper
 
-            obs_means, obs_vars = wrapper(
-                cpdf_st, lnM_st, patch_st,
-                mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
-                layer0_sr_patched, mean_fn_sr_shared_patched,
-                scatter_sigma_per_cluster)
+            # Flag-gated return arity: 2-tuple (mean, var) by default; 3-tuple
+            # (mean, var, cov) when the full covariance is requested.
+            if compute_full_cov:
+                obs_means, obs_vars, obs_covs = wrapper(
+                    cpdf_st, lnM_st, patch_st,
+                    mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
+                    layer0_sr_patched, mean_fn_sr_shared_patched,
+                    scatter_sigma_per_cluster)
+            else:
+                obs_means, obs_vars = wrapper(
+                    cpdf_st, lnM_st, patch_st,
+                    mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
+                    layer0_sr_patched, mean_fn_sr_shared_patched,
+                    scatter_sigma_per_cluster)
 
             # Per-cluster predictions (shape (n_stacked_clusters, *obs_shape))
             # are saved so external diagnostics can stratify the stacked
@@ -2637,7 +2706,14 @@ class cluster_number_counts:
             stacked_model_vec = jnp.sum(obs_means, axis=0) / n_clusters
             stacked_var_vec = jnp.sum(obs_vars, axis=0) / n_clusters**2
 
-            if compute_stacked_cov:
+            if compute_full_cov:
+                # Full Σ of the stacked MEAN: per-cluster covariances add
+                # (clusters independent) and the mean scales by 1/N². The
+                # diagonal of this matrix equals stacked_var_vec by construction.
+                stacked_cov_mat = jnp.atleast_2d(
+                    jnp.sum(obs_covs, axis=0) / n_clusters**2)
+                stacked_inv_cov = jnp.linalg.inv(stacked_cov_mat)
+            elif compute_stacked_cov:
                 if stacked_var_vec.ndim == 0 or stacked_var_vec.size == 1:
                     # 1x1 matrix so jnp.dot promotion gives a 0-D log-lik below.
                     stacked_inv_cov = (1. / stacked_var_vec.ravel()[0]
@@ -2652,6 +2728,8 @@ class cluster_number_counts:
 
             self.stacked_model[stacked_data_label] = stacked_model_vec
             self.stacked_variance[stacked_data_label] = stacked_var_vec
+            if compute_full_cov:
+                self.stacked_covariance[stacked_data_label] = stacked_cov_mat
 
             log_lik = log_lik - 0.5 * jnp.dot(res, jnp.dot(inv_cov_use, res))
 
