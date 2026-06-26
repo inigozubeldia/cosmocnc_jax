@@ -2388,17 +2388,19 @@ class cluster_number_counts:
                     c_end = min(c_start + bc_chunk, n_bc)
                     sl = slice(c_start, c_end)
                     pre_nd_chunk = _compute_all_set_cpdfs(sl)
-                    # Slice per-cluster args
-                    pc_args_sl = tuple(
-                        tuple(p[sl] for p in pc_tuple) for pc_tuple in pc_args)
+                    # Slice per-cluster args. FIX (2026-06-26): use tree_map so EVERY per-cluster
+                    # leaf is sliced regardless of nesting depth. The old `p[sl] for p in pc_tuple`
+                    # sliced only one level, so the nested per-observable tuples in all_layer0_sr_pc
+                    # had their per-cluster arrays left at full N -> vmap size mismatch (chunk vs N)
+                    # whenever bc_chunk_size < N. Latent: never triggered when N <= bc_chunk_size.
+                    pc_args_sl = jax.tree_util.tree_map(lambda a: a[sl], pc_args)
                     # Slice per-cluster cov (cov is per-set, each (n_bc, n_obs, n_obs))
                     cov_l0_sl = tuple(c[sl] for c in shared_args[3])
                     cov_l1_sl = tuple(c[sl] for c in shared_args[4])
                     # Slice 1-layer per-cluster data (always slice, even dummy arrays)
                     obs_1l_sl = obs_vals_1l[:, sl]
                     has_1l_sl = has_obs_1l[:, sl]
-                    l0_pc_1l_sl = tuple(
-                        tuple(p[sl] for p in pc) for pc in l0_pc_1l)
+                    l0_pc_1l_sl = jax.tree_util.tree_map(lambda a: a[sl], l0_pc_1l)
                     ll, cw, lm = self._allinone_bc_jit(
                         lnM_min[sl], lnM_max[sl],
                         all_obs_vals[:, sl], all_has_obs[:, sl],
@@ -2421,6 +2423,10 @@ class cluster_number_counts:
                 lnM_grid = jnp.concatenate(lnM_list)
 
             log_lik_data_rank = jnp.sum(log_liks)
+
+            # Per-cluster backward-conv log-likelihoods (one entry per cluster; sum == log_lik_data_rank).
+            # Exposed for diagnostics and chunking-correctness checks (no cluster dropped across chunks).
+            self.bc_log_lik_per_cluster = log_liks
 
             # Store cpdf and lnM arrays for stacked likelihood
             self.bc_cpdf_array = cpdf_with_hmf
