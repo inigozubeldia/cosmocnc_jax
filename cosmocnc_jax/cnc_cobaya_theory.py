@@ -33,12 +33,12 @@ _CNC_PARAM_KEYS = (
     "obs_select_min", "obs_select_max", "z_min", "z_max",
     # cosmology / hmf
     "cosmology_tool", "M_min", "M_max", "M_min_extended", "M_min_cutoff",
-    "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv",
+    "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv", "fft_mode",
     "power_spectrum_type", "cosmo_amplitude_parameter", "cosmo_param_density",
     "scalrel_type_deriv", "sigma_scatter_min", "interp_tinker", "Hubble_parameter",
     "cosmo_model", "class_sz_ndim_masses", "class_sz_concentration_parameter",
     "class_sz_output", "class_sz_hmf", "class_sz_use_m500c_in_ym_relation",
-    "class_sz_use_m200c_in_ym_relation",
+    "class_sz_use_m200c_in_ym_relation", "refresh_mass_conversion_grid",
     # redshift errors
     "z_errors", "n_z_error_integral", "z_error_sigma_integral_range",
     "z_error_min", "z_bounds", "convolve_nz", "sigma_nz",
@@ -117,6 +117,7 @@ class cnc(classy):
     hmf_type : Optional[str] =  "Tinker08"
     mass_definition : Optional[str] =  "500c"
     hmf_type_deriv : Optional[str] =  "numerical" #"analytical" or "numerical"
+    fft_mode : Optional[str] = "auto" #"exact"|"tpu"|"auto"; TPU uses FFT-free sigma + c64 conv
     power_spectrum_type : Optional[str] =  "cosmopower"
     cosmo_amplitude_parameter : Optional[str] =  "sigma_8" #"sigma_8" or "A_s"
     scalrel_type_deriv : Optional[str] =  "analytical" #"analytical" or "numerical"
@@ -191,6 +192,7 @@ class cnc(classy):
     convolve_nz: Optional[bool] = False
     sigma_nz: Optional[float] = 0.
     non_validated_clusters: Optional[bool] = False
+    refresh_mass_conversion_grid: Optional[bool] = False
     cov_constant: Optional[dict] = None
     observable_vectorised: Optional[object] = True
     observable_vector: Optional[object] = False
@@ -233,6 +235,7 @@ class cnc(classy):
         self.cnc.cnc_params["cosmo_model"] = self.cosmo_model
         self.cnc.cnc_params["cosmo_param_density"] = self.cosmo_param_density
         self.cnc.cnc_params["interp_tinker"] = self.interp_tinker
+        self.cnc.cnc_params["fft_mode"] = self.fft_mode
 
         #Observables and catalogue
 
@@ -508,7 +511,17 @@ class cnc(classy):
 
             if p == "Om0h2":
 
-                derived[p] = self.cnc.cosmo_params["Om0h2"]
+                # omega_m (cdm+b, no nu) = Om0 * h^2.  cosmo_params has no "Om0h2"
+                # key, so the old `cosmo_params["Om0h2"]` KeyError'd whenever Om0h2
+                # was requested as a derived output. Om0 and h are set in every
+                # density mode (physical/critical/mixed), so this is always valid.
+                derived[p] = self.cnc.cosmo_params["Om0"] * self.cnc.cosmo_params["h"]**2
+
+            if p == "Oc0h2":
+
+                # omega_cdm; resolved into cosmo_params in every density mode
+                # (sampled in "physical", derived in "critical"/"mixed").
+                derived[p] = self.cnc.cosmo_params["Oc0h2"]
 
             if p == "Ob0h2":
 

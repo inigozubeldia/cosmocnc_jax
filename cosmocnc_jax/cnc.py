@@ -1410,6 +1410,21 @@ class cluster_number_counts:
 
         self.cosmo_params = cosmo_params
         self.cosmology.update_cosmology(cosmo_params,cosmology_tool=self.cnc_params["cosmology_tool"])
+
+        # Optionally refresh cosmology-dependent precomputed SR grids (e.g. the q_szifi
+        # M500c/M200c mass-conversion grid) at the NEW cosmology. Gated by
+        # `refresh_mass_conversion_grid`: default False = legacy behaviour (grid built once
+        # at initialise() and held frozen); True = rebuild each step to track the sampled
+        # cosmology (correct; the NumPy reference computes this conversion live at eval).
+        # Survey-agnostic: only refresh SRs that ACTUALLY built a grid at initialise()
+        # (i.e. _log_m500_over_m200_grid is set) -- since all observables can share one SR
+        # class, a plain hasattr would also rebuild grids on SRs that never use them.
+        if self.cnc_params.get("refresh_mass_conversion_grid", False):
+            for sr in getattr(self, "scaling_relations", {}).values():
+                if (getattr(sr, "_log_m500_over_m200_grid", None) is not None
+                        and hasattr(sr, "_precompute_mass_conversion")):
+                    sr._precompute_mass_conversion()
+
         self.scal_rel_params = {}
 
         for key in scal_rel_params.keys():

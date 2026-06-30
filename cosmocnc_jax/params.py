@@ -123,6 +123,10 @@ cnc_params_default = {
     "compute_stacked_cov": True,
     "stacked_full_cov": False, #if True, stacked χ² uses the FULL inter-component covariance (mass-scatter off-diagonals) and exposes nc.stacked_covariance; default off = diagonal (byte-identical hot path)
 
+    #Scaling-relation grid refresh
+
+    "refresh_mass_conversion_grid": False, #if True, update_params rebuilds any cosmology-dependent precomputed SR grids (e.g. the q_szifi M500c/M200c mass-conversion grid) at the sampled cosmology each step (correct; matches the NumPy reference which computes the conversion live). Default False = legacy frozen-grid behaviour (grid built once at initialise() and held). See cnc.update_params.
+
     #Only for simulator
 
     "cov_constant": {"0": True, "1": True},
