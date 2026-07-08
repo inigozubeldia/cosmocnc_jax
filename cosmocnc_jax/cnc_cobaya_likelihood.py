@@ -1,6 +1,7 @@
 from cobaya.likelihood import Likelihood
 from typing import Optional, Sequence
 import numpy as np
+import os
 
 class theta_mc_prior(Likelihood):
     # variables from yaml
@@ -84,6 +85,27 @@ class joint_gaussian_prior(Likelihood):
                 f"joint_gaussian_prior: params_order has {n} entries but "
                 f"'{self.prior_file}' stores mean {self.mean.shape}, "
                 f"cov {cov.shape}.")
+
+        # [2026-07-08 audit hardening] Guard against a silently transposed/reordered
+        # prior: for the KNOWN prior files, the npz's own `names` field must be in
+        # the exact order that maps positionally onto params_order (shape alone
+        # cannot catch a reorder). Unknown files: pairing is logged for inspection.
+        _known_orders = {
+            "wl_prior_magneticum_4sigma_trim.npz":
+                ["alpha", "alpha_sigma", "b0", "s0", "b1", "s1", "b2", "s2", "b3", "s3"],
+            "cmblensing_prior_magneticum_corr.npz":
+                ["a_beta", "alpha_beta", "beta_beta"],
+        }
+        _base = os.path.basename(str(self.prior_file))
+        if "names" in data:
+            _names = [str(x) for x in np.atleast_1d(data["names"])][:n]
+            if _base in _known_orders and _names != _known_orders[_base]:
+                raise ValueError(
+                    f"joint_gaussian_prior: npz 'names' order in '{_base}' is "
+                    f"{_names}, expected {_known_orders[_base]} — the positional "
+                    "map onto params_order would be WRONG (2026-07-08 hardening).")
+            self.log.info("joint_gaussian_prior positional map: %s",
+                          list(zip(_names, self._params)))
 
         self.inv_cov = np.linalg.inv(cov)
         self.log.info(
