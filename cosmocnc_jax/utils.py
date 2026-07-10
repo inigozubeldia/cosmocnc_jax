@@ -26,61 +26,76 @@ def set_fft_c64(flag):
 
 
 # ---------------------------------------------------------------------------
-# Direct (FFT-free) path for the 1D scatter convolutions + sorted interp.
-# fft_mode="tpu_direct" selects it (set once at cnc.initialise). Motivation:
-# TPU v6e has no fast FFT and slow gathers — the abundance stage's 3000
-# FFT convolutions + searchsorted interps per eval cost ~4.1 s there (vs
-# 15 ms on GPU). A direct convolution lowers to lax.conv_general_dilated
-# (MXU matmuls on TPU) and a compare-all index search vectorizes without a
-# binary-search gather loop. Both are mathematically identical to the
-# default path (same 'same'-mode alignment, same interpolation values);
-# only the algorithm changes. Default False → default paths byte-identical.
-# [TPU-compat task 3, 2026-07-10]
+# Searchsorted-free interpolation for the abundance hot path.
+# fft_mode="tpu_direct" selects it (set once at cnc.initialise). Stage-1
+# on-device attribution (micro_bench_tpu.py, v6e-1, 2026-07-10): the batched
+# c64 FFT convolution costs 3 ms — the abundance's ~3.9 s is the THREE
+# jnp.interp/searchsorted sites (~1.14 s each). So the convolutions stay on
+# the FFT path (set_fft_c64) and only the interps switch algorithm:
+#   - layer resample (non-uniform source -> UNIFORM target): the searchsorted
+#     result is a histogram + cumsum over the analytic source positions
+#     (x - x0)/dx — O(N), no search, no compare-all matrix.
+#   - final obs interp (UNIFORM source): analytic indexing, no search at all.
+# Both produce jnp.interp's values (up to 1-ulp index-boundary rounding).
+# Default False → default paths (jnp.interp) byte-identical.
+# [TPU-compat task 3 / Stage 1.5, 2026-07-10]
 # ---------------------------------------------------------------------------
-_CONV1D_DIRECT = False
+_TPU_INTERP = False
 
 
-def set_conv1d_direct(flag):
-    """Enable (True) the direct-conv + compare-all-interp path (fft_mode="tpu_direct")."""
-    global _CONV1D_DIRECT
-    _CONV1D_DIRECT = bool(flag)
+def set_tpu_interp(flag):
+    """Enable (True) the searchsorted-free interp path (fft_mode="tpu_direct")."""
+    global _TPU_INTERP
+    _TPU_INTERP = bool(flag)
 
 
-def _direct_convolve_same(a, b):
-    """Direct 'same'-mode convolution, same semantics as _fft_convolve_same.
+def interp_to_uniform_grid(x_grid, x_min, dx, xp, fp):
+    """Interp (xp, fp) onto the uniform grid x_grid (= x_min + i*dx), with
+    left=0/right=0 semantics. xp must be sorted (monotone layer output).
 
-    jnp.convolve lowers to lax.conv_general_dilated → MXU on TPU, cuDNN/XLA
-    on GPU. precision=HIGHEST prevents the TPU default bf16 truncation of
-    float32 convolution operands.
+    Default path: jnp.interp (unchanged). TPU path: searchsorted-free —
+    idx_i = #{j : xp[j] <= x_grid[i]} computed via a scatter-add histogram of
+    the analytic positions ceil((xp - x_min)/dx) followed by a cumsum.
     """
-    return jnp.convolve(a, b, mode="same", precision=jax.lax.Precision.HIGHEST)
-
-
-def interp_sorted(x_new, xp, fp, left=None, right=None):
-    """jnp.interp on a sorted xp; TPU-friendly under the direct path.
-
-    Default path: jnp.interp (unchanged). Direct path: compare-all index
-    search (a (n_new, n_p) comparison + row-sum instead of searchsorted's
-    binary-search loop of dynamic gathers), then a 2-point linear interp.
-    Same values as jnp.interp incl. the left/right clamping semantics
-    (left/right=None clamps to fp[0]/fp[-1], as jnp.interp does).
-    """
-    if not _CONV1D_DIRECT:
-        return jnp.interp(x_new, xp, fp, left=left, right=right)
-    idx = jnp.sum(xp[None, :] <= x_new[:, None], axis=1)
-    idx = jnp.clip(idx, 1, xp.shape[0] - 1)
+    if not _TPU_INTERP:
+        return jnp.interp(x_grid, xp, fp, left=0., right=0.)
+    n_new = x_grid.shape[0]
+    p = (xp - x_min) / dx
+    c = jnp.clip(jnp.ceil(p).astype(jnp.int32), 0, n_new)
+    h = jnp.zeros(n_new + 1, dtype=jnp.int32).at[c].add(1)
+    idx = jnp.clip(jnp.cumsum(h)[:n_new], 1, xp.shape[0] - 1)
     x_lo = xp[idx - 1]
     x_hi = xp[idx]
     f_lo = fp[idx - 1]
     f_hi = fp[idx]
-    dx = x_hi - x_lo
-    safe_dx = jnp.where(dx == 0, 1.0, dx)
-    t = jnp.where(dx == 0, 0.0, (x_new - x_lo) / safe_dx)
+    d = x_hi - x_lo
+    t = jnp.where(d == 0, 0.0, (x_grid - x_lo) / jnp.where(d == 0, 1.0, d))
     y = f_lo + t * (f_hi - f_lo)
-    left_val = fp[0] if left is None else left
-    right_val = fp[-1] if right is None else right
-    y = jnp.where(x_new < xp[0], left_val, y)
-    y = jnp.where(x_new > xp[-1], right_val, y)
+    y = jnp.where(x_grid < xp[0], 0., y)
+    y = jnp.where(x_grid > xp[-1], 0., y)
+    return y
+
+
+def interp_from_uniform_grid(x_new, x0, fp, left=0.):
+    """jnp.interp(x_new, x0, fp, left=left) where x0 IS uniform: analytic
+    indexing on the TPU path (no searchsorted); right edge clamps to fp[-1]
+    (jnp.interp's default). Default path: jnp.interp (unchanged)."""
+    if not _TPU_INTERP:
+        return jnp.interp(x_new, x0, fp, left=left)
+    n = x0.shape[0]
+    dx = x0[1] - x0[0]
+    fi = (x_new - x0[0]) / dx
+    idx = jnp.clip(jnp.floor(fi).astype(jnp.int32), 0, n - 2)
+    # lerp against the ACTUAL grid endpoints, t clamped: linspace values
+    # deviate ~n*ulp from perfect arithmetic spacing, so the analytic index
+    # can bracket one interval off for queries within ~1e-11 of a grid point;
+    # actual-endpoint + clamp bounds the error by that query-position shift.
+    x_lo = x0[idx]
+    x_hi = x0[idx + 1]
+    t = jnp.clip((x_new - x_lo) / (x_hi - x_lo), 0., 1.)
+    y = fp[idx] * (1. - t) + fp[idx + 1] * t
+    y = jnp.where(x_new < x0[0], left, y)
+    y = jnp.where(x_new > x0[-1], fp[-1], y)
     return y
 
 
@@ -238,11 +253,7 @@ def convolve_1d(x, dn_dx, sigma=None, type="fft", kernel=None, sigma_min=0):
         sigma_safe = jnp.maximum(sigma, 1e-30)
         kernel = gaussian_1d(x - jnp.mean(x) + (x[1] - x[0]) * 0.5, sigma_safe)
 
-    if _CONV1D_DIRECT:
-        # FFT-free path (fft_mode="tpu_direct"): identical 'same' semantics.
-        convolved = _direct_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
-    else:
-        convolved = _fft_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
+    convolved = _fft_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
 
     # Select convolved or original based on sigma > sigma_min (JIT-safe)
     return jnp.where(sigma > sigma_min, convolved, dn_dx)

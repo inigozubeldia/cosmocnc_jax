@@ -699,9 +699,11 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             x_min = jnp.min(x1) - pad
             x_max = jnp.max(x1) + pad
             x1_interp = jnp.linspace(x_min, x_max, n_points)
-            # interp_sorted == jnp.interp on the default path; compare-all
-            # (searchsorted-free) on the tpu_direct path.
-            dn_dx1 = interp_sorted(x1_interp, x1, dn_dx1, left=0., right=0.)
+            # == jnp.interp on the default path; searchsorted-free
+            # (histogram+cumsum, uniform target) on the tpu_direct path.
+            dn_dx1 = interp_to_uniform_grid(
+                x1_interp, x_min, (x_max - x_min) / (n_points - 1),
+                x1, dn_dx1)
 
             # Convolve with scatter
             dn_dx1 = convolve_1d(x1_interp, dn_dx1, sigma=scatter_k,
@@ -710,8 +712,9 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             x0 = x1_interp
             dn_dx0 = dn_dx1
 
-        # Final: interpolate to obs_select_vec
-        abundance = interp_sorted(obs_select_vec, x0, dn_dx0, left=0.) * 4. * jnp.pi * skyfrac
+        # Final: interpolate to obs_select_vec (x0 is uniform here — the layer
+        # loop's linspace grid, or the log-M grid when n_layers == 0)
+        abundance = interp_from_uniform_grid(obs_select_vec, x0, dn_dx0, left=0.) * 4. * jnp.pi * skyfrac
         return abundance
 
     return abundance_one_z
@@ -755,16 +758,16 @@ class cluster_number_counts:
         # + mcfit FFTLog unchanged. "tpu" selects the TPU-compatible path
         # (complex64 convolutions + FFT-free direct-quadrature sigma(R)), since
         # TPU XLA cannot lower the f64->complex128 FFT. "tpu_direct" = "tpu"
-        # plus FFT-free direct 1D scatter convolutions (lax.conv → MXU) and
-        # compare-all interp in the abundance kernel — no FFT and no
-        # searchsorted on the abundance hot path at all. "auto" picks by
-        # backend.  [TPU-compat task 3, 2026-07-10]
+        # plus searchsorted-free interps in the abundance kernel (the actual
+        # TPU bottleneck per the Stage-1 micro-bench — the FFT itself is fast;
+        # convolutions stay on the c64-FFT path). "auto" picks by backend.
+        # [TPU-compat task 3 / Stage 1.5, 2026-07-10]
         _fft_mode = self.cnc_params.get("fft_mode", "exact")
         if _fft_mode == "auto":
             _fft_mode = "tpu" if jax.default_backend() == "tpu" else "exact"
         self.cnc_params["fft_mode"] = _fft_mode
         set_fft_c64(_fft_mode in ("tpu", "tpu_direct"))
-        set_conv1d_direct(_fft_mode == "tpu_direct")
+        set_tpu_interp(_fft_mode == "tpu_direct")
 
         # Load the survey data
 
