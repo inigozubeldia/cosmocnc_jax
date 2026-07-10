@@ -445,18 +445,26 @@ class cosmology_model:
         rho_c_0 = rho_c_0 * _c.mpc**3 / _c.solar * 1e3
         rho_m = rho_c_0 * self.cosmo_params["Om0"]
 
-        if not hasattr(self, '_tv0_mc'):
-            k_arr_np = np.asarray(self._k_arr)
-            self._tv0_mc = TophatVar(k_arr_np, lowring=True, deriv=0, backend='jax')
-            self._tv1_mc = TophatVar(k_arr_np, lowring=True, deriv=1, backend='jax')
-            self._batch_sigma_fns_mc = build_batch_sigma_fns(
-                self._tv0_mc, self._tv1_mc, self._k_arr, type_deriv="analytical")
+        if self.cnc_params.get("fft_mode", "exact") == "tpu":
+            # TPU path: FFT-free direct-quadrature sigma (the mcfit FFTLog forces
+            # complex128 and cannot lower on TPU).  [TPU-compat 2026-06-15]
+            from cosmocnc_jax.hmf import batch_sigma_R_direct
+            sigma_matrix, _, _ = batch_sigma_R_direct(
+                self._k_arr, pk_batch, jnp.asarray(M_phys_vec), rho_m,
+                type_deriv="analytical")
+        else:
+            if not hasattr(self, '_tv0_mc'):
+                k_arr_np = np.asarray(self._k_arr)
+                self._tv0_mc = TophatVar(k_arr_np, lowring=True, deriv=0, backend='jax')
+                self._tv1_mc = TophatVar(k_arr_np, lowring=True, deriv=1, backend='jax')
+                self._batch_sigma_fns_mc = build_batch_sigma_fns(
+                    self._tv0_mc, self._tv1_mc, self._k_arr, type_deriv="analytical")
 
-        sigma_matrix, _, _ = batch_sigma_R_from_tophat(
-            self._tv0_mc, self._tv1_mc, pk_batch, self._k_arr,
-            jnp.asarray(M_phys_vec), rho_m,
-            type_deriv="analytical",
-            _cached_fns=self._batch_sigma_fns_mc)
+            sigma_matrix, _, _ = batch_sigma_R_from_tophat(
+                self._tv0_mc, self._tv1_mc, pk_batch, self._k_arr,
+                jnp.asarray(M_phys_vec), rho_m,
+                type_deriv="analytical",
+                _cached_fns=self._batch_sigma_fns_mc)
         return sigma_matrix
 
     def compute_log_m500c_over_m200c_grid(self, z_tab, lnM_tab_phys_1e14,

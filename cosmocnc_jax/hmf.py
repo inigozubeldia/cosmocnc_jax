@@ -475,6 +475,90 @@ def batch_sigma_R_from_tophat(tv0, tv1, pk_batch, k_arr, M_vec, rho_m,
     return sigma_matrix, dsigma_matrix, R_matrix
 
 
+# ---------------------------------------------------------------------------
+# FFT-free sigma(R): direct quadrature of
+#     sigma^2(R) = (1/2pi^2) int_0^inf k^2 P(k) W^2(kR) dk
+# evaluated as a contraction over the k grid (a MATMUL -> TPU-native, no complex
+# FFT, so it lowers on TPU where the mcfit FFTLog cannot). The R-derivative is
+# analytic via the window derivative W'. Numerically matches the mcfit FFTLog to
+# quadrature precision.  [TPU-compat 2026-06-15]
+# ---------------------------------------------------------------------------
+
+def _tophat_W(x):
+    """Top-hat window W(x) = 3 (sin x - x cos x)/x^3, stable at small x (W(0)=1)."""
+    x2 = x * x
+    xs = jnp.where(x > 0.1, x, 1.0)          # dummy below threshold (series used there)
+    w_big = 3.0 * (jnp.sin(xs) - xs * jnp.cos(xs)) / xs**3
+    w_small = 1.0 - x2/10.0 + x2*x2/280.0 - x2*x2*x2/15120.0
+    return jnp.where(x > 0.1, w_big, w_small)
+
+
+def _tophat_Wprime(x):
+    """dW/dx = 3[(x^2-3) sin x + 3x cos x]/x^4, stable at small x (W'(0)=0)."""
+    x2 = x * x
+    xs = jnp.where(x > 0.1, x, 1.0)
+    wp_big = 3.0 * ((xs*xs - 3.0) * jnp.sin(xs) + 3.0 * xs * jnp.cos(xs)) / xs**4
+    wp_small = -x/5.0 + x*x2/70.0 - x*x2*x2/2520.0
+    return jnp.where(x > 0.1, wp_big, wp_small)
+
+
+def _simpson_weights(n, h):
+    """Composite Simpson weights for n (odd) uniformly-spaced points, spacing h."""
+    w = jnp.ones(n)
+    w = w.at[1:-1:2].set(4.0)
+    w = w.at[2:-1:2].set(2.0)
+    return w * (h / 3.0)
+
+
+def batch_sigma_R_direct(k_arr, pk_batch, M_vec, rho_m, type_deriv="analytical",
+                         n_fine=8193):
+    """FFT-free batch sigma(M), dsigma/dR(M) by direct quadrature (TPU-safe).
+
+    sigma^2(R) = (1/2pi^2) int k^2 P(k) W^2(kR) dk. P(k) is resampled (log-log
+    interp) onto a fine, uniform log-k grid; the oscillatory top-hat window is
+    evaluated analytically on that grid; the integral is composite Simpson ->
+    a matmul over k (TPU-native, no complex FFT). The R-derivative is analytic
+    via W'. The fine grid + Simpson match the mcfit FFTLog to high precision.
+
+    Same returns as batch_sigma_R_from_tophat: sigma, dsigma, R_matrix, each
+    (n_z, n_M).
+    """
+    k = jnp.asarray(k_arr)
+    lnk = jnp.log(k)
+
+    # fine uniform log-k grid (odd count -> clean composite Simpson)
+    lnk_f = jnp.linspace(lnk[0], lnk[-1], n_fine)
+    kf = jnp.exp(lnk_f)
+    # resample P(k) in log-log (P is power-law-smooth; the *window* oscillation
+    # is resolved by the fine grid, not by P, so this stays accurate even for a
+    # coarse native k grid)
+    lnpk = jnp.log(jnp.maximum(pk_batch, 1e-300))                  # (n_z, n_k)
+    lnpk_f = jax.vmap(lambda row: jnp.interp(lnk_f, lnk, row))(lnpk)  # (n_z, n_fine)
+    pkf = jnp.exp(lnpk_f)
+
+    R_M = (3.0 * M_vec / (4.0 * jnp.pi * rho_m))**(1.0/3.0)        # (n_M,)
+    x = kf[:, None] * R_M[None, :]                                # (n_fine, n_M)
+    W = _tophat_W(x)
+    h = (lnk_f[-1] - lnk_f[0]) / (n_fine - 1)
+    wq = _simpson_weights(n_fine, h)                             # (n_fine,) over dlnk
+
+    pref = (kf**3) * wq / (2.0 * jnp.pi**2)                      # (n_fine,)
+    var = (pkf * pref[None, :]) @ (W * W)                        # (n_z, n_M)
+    sigma = jnp.sqrt(var)
+
+    if type_deriv == "analytical":
+        Wp = _tophat_Wprime(x)
+        # d sigma^2/dR = (1/pi^2) int k^3 P(k) W W' dk  (extra k from dW(kR)/dR)
+        pref_d = (kf**4) * wq / (jnp.pi**2)                     # (n_fine,)
+        dvar_dR = (pkf * pref_d[None, :]) @ (W * Wp)            # (n_z, n_M)
+        dsigma = dvar_dR / (2.0 * sigma)
+    else:
+        dsigma = jnp.gradient(sigma, R_M, axis=1)
+
+    R_matrix = jnp.broadcast_to(R_M[None, :], var.shape)
+    return sigma, dsigma, R_matrix
+
+
 #Delta is w.r.t. mean
 
 def f_sigma(sigma, redshift=None, hmf_type="Tinker08", Delta=None, mass_definition="500c", other_params=None):

@@ -9,6 +9,21 @@ import sys
 
 import logging
 
+# ---------------------------------------------------------------------------
+# FFT path switch. Default (exact float64 FFT) keeps the GPU/CPU behaviour
+# byte-for-byte unchanged. set_fft_c64(True) selects the TPU-compatible path:
+# convolutions cast to float32 -> complex64 FFT, because TPU XLA cannot lower
+# the float64 jnp.fft (it rejects the f64->complex128 cast). Set once at
+# cnc.initialise() from cnc_params["fft_mode"].  [TPU-compat 2026-06-15]
+# ---------------------------------------------------------------------------
+_FFT_C64 = False
+
+
+def set_fft_c64(flag):
+    """Enable (True) the complex64 FFT path for TPU, or the exact f64 path (False)."""
+    global _FFT_C64
+    _FFT_C64 = bool(flag)
+
 def configure_logging(level=logging.INFO):
     logging.basicConfig(
         format='%(levelname)s - %(message)s',
@@ -139,9 +154,17 @@ def _fft_convolve_same(a, b):
     fft_size = 1
     while fft_size < n + m - 1:
         fft_size *= 2
-    A = jnp.fft.rfft(a, n=fft_size)
-    B = jnp.fft.rfft(b, n=fft_size)
-    result = jnp.fft.irfft(A * B, n=fft_size)
+    if _FFT_C64:
+        # TPU path: complex64 FFT (cast inputs to float32), cast result back.
+        out_dtype = jnp.result_type(a, b)
+        A = jnp.fft.rfft(a.astype(jnp.float32), n=fft_size)
+        B = jnp.fft.rfft(b.astype(jnp.float32), n=fft_size)
+        result = jnp.fft.irfft(A * B, n=fft_size).astype(out_dtype)
+    else:
+        # Default GPU/CPU path: exact float64 FFT (unchanged).
+        A = jnp.fft.rfft(a, n=fft_size)
+        B = jnp.fft.rfft(b, n=fft_size)
+        result = jnp.fft.irfft(A * B, n=fft_size)
     # 'same' mode: return n elements centered on the full output
     start = (m - 1) // 2
     return result[start:start + n]
@@ -175,6 +198,12 @@ def _circular_convolve(a, kernel):
     """
     shifts = tuple(-((s - 1) // 2) for s in kernel.shape)
     kernel_shifted = jnp.roll(kernel, shifts, axis=tuple(range(kernel.ndim)))
+    if _FFT_C64:
+        # TPU path: complex64 FFT.
+        out_dtype = jnp.result_type(a, kernel)
+        A = jnp.fft.fftn(a.astype(jnp.float32))
+        K = jnp.fft.fftn(kernel_shifted.astype(jnp.float32))
+        return jnp.fft.ifftn(A * K).real.astype(out_dtype)
     A = jnp.fft.fftn(a)
     K = jnp.fft.fftn(kernel_shifted)
     return jnp.fft.ifftn(A * K).real
@@ -196,9 +225,17 @@ def _fft_convolve_same_nd(a, kernel):
             fft_size *= 2
         fft_shape.append(fft_size)
 
-    A = jnp.fft.fftn(a, s=fft_shape)
-    K = jnp.fft.fftn(kernel, s=fft_shape)
-    result = jnp.fft.ifftn(A * K).real
+    if _FFT_C64:
+        # TPU path: complex64 FFT (cast inputs to float32), cast result back.
+        out_dtype = jnp.result_type(a, kernel)
+        A = jnp.fft.fftn(a.astype(jnp.float32), s=fft_shape)
+        K = jnp.fft.fftn(kernel.astype(jnp.float32), s=fft_shape)
+        result = jnp.fft.ifftn(A * K).real.astype(out_dtype)
+    else:
+        # Default GPU/CPU path: exact float64 FFT (unchanged).
+        A = jnp.fft.fftn(a, s=fft_shape)
+        K = jnp.fft.fftn(kernel, s=fft_shape)
+        result = jnp.fft.ifftn(A * K).real
 
     # 'same' mode: extract center crop of size a.shape
     slices = []
