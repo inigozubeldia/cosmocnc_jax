@@ -450,7 +450,7 @@ class cosmology_model:
             rho_c_0 = rho_c_0 * 1e3 * (_c.mpc**3 / _c.solar)
         rho_m = rho_c_0 * self.cosmo_params["Om0"]
 
-        if self.cnc_params.get("fft_mode", "exact") == "tpu":
+        if self.cnc_params.get("fft_mode", "exact") in ("tpu", "tpu_direct"):
             # TPU path: FFT-free direct-quadrature sigma (the mcfit FFTLog forces
             # complex128 and cannot lower on TPU).  [TPU-compat 2026-06-15]
             from cosmocnc_jax.hmf import batch_sigma_R_direct

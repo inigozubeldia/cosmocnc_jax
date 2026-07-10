@@ -159,7 +159,7 @@ class cnc(classy):
     hmf_type : Optional[str] =  "Tinker08"
     mass_definition : Optional[str] =  "500c"
     hmf_type_deriv : Optional[str] =  "numerical" #"analytical" or "numerical"
-    fft_mode : Optional[str] = "auto" #"exact"|"tpu"|"auto"; TPU uses FFT-free sigma + c64 conv
+    fft_mode : Optional[str] = "auto" #"exact"|"tpu"|"tpu_direct"|"auto"; tpu: FFT-free sigma + c64 conv; tpu_direct: + direct conv/compare-all interp (FFT/searchsorted-free abundance)
     power_spectrum_type : Optional[str] =  "cosmopower"
     cosmo_amplitude_parameter : Optional[str] =  "sigma_8" #"sigma_8" or "A_s"
     scalrel_type_deriv : Optional[str] =  "analytical" #"analytical" or "numerical"

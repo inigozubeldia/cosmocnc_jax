@@ -24,6 +24,66 @@ def set_fft_c64(flag):
     global _FFT_C64
     _FFT_C64 = bool(flag)
 
+
+# ---------------------------------------------------------------------------
+# Direct (FFT-free) path for the 1D scatter convolutions + sorted interp.
+# fft_mode="tpu_direct" selects it (set once at cnc.initialise). Motivation:
+# TPU v6e has no fast FFT and slow gathers — the abundance stage's 3000
+# FFT convolutions + searchsorted interps per eval cost ~4.1 s there (vs
+# 15 ms on GPU). A direct convolution lowers to lax.conv_general_dilated
+# (MXU matmuls on TPU) and a compare-all index search vectorizes without a
+# binary-search gather loop. Both are mathematically identical to the
+# default path (same 'same'-mode alignment, same interpolation values);
+# only the algorithm changes. Default False → default paths byte-identical.
+# [TPU-compat task 3, 2026-07-10]
+# ---------------------------------------------------------------------------
+_CONV1D_DIRECT = False
+
+
+def set_conv1d_direct(flag):
+    """Enable (True) the direct-conv + compare-all-interp path (fft_mode="tpu_direct")."""
+    global _CONV1D_DIRECT
+    _CONV1D_DIRECT = bool(flag)
+
+
+def _direct_convolve_same(a, b):
+    """Direct 'same'-mode convolution, same semantics as _fft_convolve_same.
+
+    jnp.convolve lowers to lax.conv_general_dilated → MXU on TPU, cuDNN/XLA
+    on GPU. precision=HIGHEST prevents the TPU default bf16 truncation of
+    float32 convolution operands.
+    """
+    return jnp.convolve(a, b, mode="same", precision=jax.lax.Precision.HIGHEST)
+
+
+def interp_sorted(x_new, xp, fp, left=None, right=None):
+    """jnp.interp on a sorted xp; TPU-friendly under the direct path.
+
+    Default path: jnp.interp (unchanged). Direct path: compare-all index
+    search (a (n_new, n_p) comparison + row-sum instead of searchsorted's
+    binary-search loop of dynamic gathers), then a 2-point linear interp.
+    Same values as jnp.interp incl. the left/right clamping semantics
+    (left/right=None clamps to fp[0]/fp[-1], as jnp.interp does).
+    """
+    if not _CONV1D_DIRECT:
+        return jnp.interp(x_new, xp, fp, left=left, right=right)
+    idx = jnp.sum(xp[None, :] <= x_new[:, None], axis=1)
+    idx = jnp.clip(idx, 1, xp.shape[0] - 1)
+    x_lo = xp[idx - 1]
+    x_hi = xp[idx]
+    f_lo = fp[idx - 1]
+    f_hi = fp[idx]
+    dx = x_hi - x_lo
+    safe_dx = jnp.where(dx == 0, 1.0, dx)
+    t = jnp.where(dx == 0, 0.0, (x_new - x_lo) / safe_dx)
+    y = f_lo + t * (f_hi - f_lo)
+    left_val = fp[0] if left is None else left
+    right_val = fp[-1] if right is None else right
+    y = jnp.where(x_new < xp[0], left_val, y)
+    y = jnp.where(x_new > xp[-1], right_val, y)
+    return y
+
+
 def configure_logging(level=logging.INFO):
     logging.basicConfig(
         format='%(levelname)s - %(message)s',
@@ -178,7 +238,11 @@ def convolve_1d(x, dn_dx, sigma=None, type="fft", kernel=None, sigma_min=0):
         sigma_safe = jnp.maximum(sigma, 1e-30)
         kernel = gaussian_1d(x - jnp.mean(x) + (x[1] - x[0]) * 0.5, sigma_safe)
 
-    convolved = _fft_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
+    if _CONV1D_DIRECT:
+        # FFT-free path (fft_mode="tpu_direct"): identical 'same' semantics.
+        convolved = _direct_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
+    else:
+        convolved = _fft_convolve_same(dn_dx, kernel) / jnp.sum(kernel)
 
     # Select convolved or original based on sigma > sigma_min (JIT-safe)
     return jnp.where(sigma > sigma_min, convolved, dn_dx)
