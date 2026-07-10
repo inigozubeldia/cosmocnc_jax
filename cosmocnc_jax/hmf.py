@@ -169,7 +169,14 @@ class halo_mass_function:
 
         if self.hmf_type == "Tinker08":
 
-            self.rho_c_0 = self.cosmology.background_cosmology.critical_density(0.).value*self.const.mpc**3/self.const.solar*1e3
+            if jax.config.jax_enable_x64:
+                self.rho_c_0 = self.cosmology.background_cosmology.critical_density(0.).value*self.const.mpc**3/self.const.solar*1e3
+            else:
+                # fp32-safe order: mpc^3 ~ 2.9e67 overflows float32 as an
+                # intermediate; group as mpc^3/solar ~ 1.5e37 (in range).
+                # x64 branch above is the original expression, byte-identical.
+                # [fp32-compat 2026-07-10]
+                self.rho_c_0 = self.cosmology.background_cosmology.critical_density(0.).value*1e3*(self.const.mpc**3/self.const.solar)
 
         if self.hmf_calc == "hmf":
 

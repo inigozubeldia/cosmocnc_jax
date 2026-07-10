@@ -442,7 +442,12 @@ class cosmology_model:
         # We reuse the cosmology object's already-set background_cosmology.
         from cosmocnc_jax.hmf import constants as _hmf_constants
         _c = _hmf_constants()
-        rho_c_0 = rho_c_0 * _c.mpc**3 / _c.solar * 1e3
+        if jax.config.jax_enable_x64:
+            rho_c_0 = rho_c_0 * _c.mpc**3 / _c.solar * 1e3
+        else:
+            # fp32-safe order: mpc^3 ~ 2.9e67 overflows float32; group as
+            # mpc^3/solar ~ 1.5e37 (in range).  [fp32-compat 2026-07-10]
+            rho_c_0 = rho_c_0 * 1e3 * (_c.mpc**3 / _c.solar)
         rho_m = rho_c_0 * self.cosmo_params["Om0"]
 
         if self.cnc_params.get("fft_mode", "exact") == "tpu":
@@ -516,10 +521,18 @@ class cosmology_model:
         Om_z_tab = Om0 * z1**3 / Ez2
 
         h = self.cosmo_params["h"]
-        rho_c_0_in_Msun_Mpc3 = (
-            self.background_cosmology.critical_density(0.).value
-            * _hmf_constants().mpc**3 / _hmf_constants().solar * 1e3
-        )
+        if jax.config.jax_enable_x64:
+            rho_c_0_in_Msun_Mpc3 = (
+                self.background_cosmology.critical_density(0.).value
+                * _hmf_constants().mpc**3 / _hmf_constants().solar * 1e3
+            )
+        else:
+            # fp32-safe order (see the sigma-matrix site above).
+            # [fp32-compat 2026-07-10]
+            rho_c_0_in_Msun_Mpc3 = (
+                self.background_cosmology.critical_density(0.).value
+                * 1e3 * (_hmf_constants().mpc**3 / _hmf_constants().solar)
+            )
         rho_c_z_tab = rho_c_0_in_Msun_Mpc3 * Ez2
 
         return log_m500c_over_m200c_grid_virial(
@@ -922,13 +935,23 @@ class classy_sz_jax_cosmo:
         return (k, pk)
 
     def critical_density(self, z):
-        conv_fac = 1. / (1000. * self.const.mpc**3 / self.const.solar)
         h = self._h
         rho = self.classy.get_rho_crit_at_z(z, params_values_dict=self.pvd)
         rho = jnp.asarray(rho)
 
+        if jax.config.jax_enable_x64:
+            conv_fac = 1. / (1000. * self.const.mpc**3 / self.const.solar)
+            val = rho * conv_fac * h**2
+        else:
+            # fp32-safe order: conv_fac ~ 6.8e-41 is SUBNORMAL in float32 (and
+            # flushes to zero on TPU). Stage the division so every intermediate
+            # stays in normal float32 range (mpc^3/solar ~ 1.5e37 < f32 max).
+            # x64 branch above is the original expression, byte-identical.
+            # [fp32-compat 2026-07-10]
+            val = rho * h**2 / 1000. / (self.const.mpc**3 / self.const.solar)
+
         class result:
-            value = rho * conv_fac * h**2
+            value = val
 
         return result
 
