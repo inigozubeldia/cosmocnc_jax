@@ -78,9 +78,12 @@ def interp_to_uniform_grid(x_grid, x_min, dx, xp, fp):
 
 def interp_from_uniform_grid(x_new, x0, fp, left=0.):
     """jnp.interp(x_new, x0, fp, left=left) where x0 IS uniform: analytic
-    indexing on the TPU path (no searchsorted); right edge clamps to fp[-1]
-    (jnp.interp's default). Default path: jnp.interp (unchanged)."""
+    indexing on the TPU path (no searchsorted); left=None clamps to fp[0]
+    and the right edge clamps to fp[-1] (jnp.interp's defaults).
+    Default path: jnp.interp (unchanged)."""
     if not _TPU_INTERP:
+        if left is None:
+            return jnp.interp(x_new, x0, fp)
         return jnp.interp(x_new, x0, fp, left=left)
     n = x0.shape[0]
     dx = x0[1] - x0[0]
@@ -94,7 +97,7 @@ def interp_from_uniform_grid(x_new, x0, fp, left=0.):
     x_hi = x0[idx + 1]
     t = jnp.clip((x_new - x_lo) / (x_hi - x_lo), 0., 1.)
     y = fp[idx] * (1. - t) + fp[idx + 1] * t
-    y = jnp.where(x_new < x0[0], left, y)
+    y = jnp.where(x_new < x0[0], fp[0] if left is None else left, y)
     y = jnp.where(x_new > x0[-1], fp[-1], y)
     return y
 
