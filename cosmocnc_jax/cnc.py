@@ -12,7 +12,23 @@ from .utils import *
 import time
 import importlib.util
 import sys
+import os
 from itertools import combinations
+
+# Env-gated internal phase profiler (CNC_PROFILE_INTERNAL=1): prints per-phase
+# wall times with a device sync at each mark, so async dispatch cannot smear
+# one phase's cost into the next. Zero overhead when off. [tpu branch]
+_PROF_INTERNAL = bool(int(os.environ.get("CNC_PROFILE_INTERNAL", "0")))
+
+
+def _prof_mark(label, t_prev, sync=None):
+    if not _PROF_INTERNAL:
+        return t_prev
+    if sync is not None:
+        jax.block_until_ready(sync)
+    t = time.time()
+    print(f"[prof] {label:26s} {(t - t_prev) * 1e3:8.2f} ms", flush=True)
+    return t
 
 
 # =====================================================================
@@ -1854,6 +1870,8 @@ class cluster_number_counts:
 
     def get_log_lik_data(self):
 
+        _tp_bc = _prof_mark("bc:enter", time.time())
+
         indices_no_z = self.catalogue.indices_no_z #indices of clusters with no redshift
         indices_obs_select = self.catalogue.indices_obs_select #indices of clusters with redshift and only the selection observable
         indices_other_obs = self.catalogue.indices_other_obs #indices of clusters with redshift, the selection observable, and other observables
@@ -2462,7 +2480,9 @@ class cluster_number_counts:
 
             if bc_chunk <= 0 or n_bc <= bc_chunk:
                 # Full vmap: all clusters at once
+                _tp_bc = _prof_mark("bc:assembly", _tp_bc, lnM_min)
                 pre_nd_cpdfs = _compute_all_set_cpdfs()
+                _tp_bc = _prof_mark("bc:set_cpdfs", _tp_bc, pre_nd_cpdfs)
                 _bc_args = (
                     lnM_min, lnM_max, all_obs_vals, all_has_obs,
                     hmf_z_c, skyfracs_clusters,
@@ -2573,6 +2593,8 @@ class cluster_number_counts:
                 cpdf_with_hmf = jnp.concatenate(cpdf_list)
                 lnM_grid = jnp.concatenate(lnM_list)
 
+            _tp_bc = _prof_mark("bc:allinone", _tp_bc, log_liks)
+
             log_lik_data_rank = jnp.sum(log_liks)
 
             # Per-cluster backward-conv log-likelihoods (one entry per cluster; sum == log_lik_data_rank).
@@ -2595,6 +2617,8 @@ class cluster_number_counts:
                 self.bc_lnM_stds = lnM_stds
 
             log_lik_data = log_lik_data + log_lik_data_rank
+
+            _prof_mark("bc:post", _tp_bc, log_lik_data)
 
         return log_lik_data
 
@@ -3024,10 +3048,13 @@ class cluster_number_counts:
     def get_log_lik_unbinned(self):
 
         t0 = time.time()
+        _tp = _prof_mark("unbinned:enter", t0)
 
         if self.hmf_matrix is None:
 
             self.get_hmf()
+
+        _tp = _prof_mark("unbinned:hmf", _tp, self.hmf_matrix)
 
         t1 = time.time()
 
@@ -3036,6 +3063,8 @@ class cluster_number_counts:
         if self.n_tot is None:
 
             self.get_number_counts()
+
+        _tp = _prof_mark("unbinned:abundance+counts", _tp, self.n_tot)
 
         #Abundance term
 
@@ -3061,12 +3090,16 @@ class cluster_number_counts:
 
         log_lik = log_lik + self.get_log_lik_data()
 
+        _tp = _prof_mark("unbinned:data(bc)", _tp, log_lik)
+
         self.t_data = time.time()-t2
 
         #Stacked_term
 
         if self.cnc_params["stacked_likelihood"] == True:
             log_lik = log_lik + self.get_log_lik_stacked()
+
+        _prof_mark("unbinned:stacked+rest", _tp, log_lik)
 
         return log_lik
 
