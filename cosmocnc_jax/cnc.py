@@ -31,6 +31,22 @@ def _prof_mark(label, t_prev, sync=None):
     return t
 
 
+# Host-glue reduction (tpu branch): gather axis-0 of EVERY leaf of a pytree in
+# ONE compiled dispatch instead of one dispatch per leaf. The bc set-cpdf group
+# slicing issues ~35 small gathers per eval otherwise (measured: the bc cost is
+# host dispatch, not device compute). Compiled once per treedef/shape set,
+# which is static per catalogue pattern group.  [Stage 2d, 2026-07-13]
+@jax.jit
+def _jit_tree_gather(tree, idx):
+    return jax.tree_util.tree_map(lambda p: p[idx], tree)
+
+
+@jax.jit
+def _jit_cov_subslice(cov0, cov1, idx, si):
+    """Per-group covariance sub-slice [idx][:, si][:, :, si] in one dispatch."""
+    return (cov0[idx][:, si][:, :, si], cov1[idx][:, si][:, :, si])
+
+
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
 # =====================================================================
@@ -2216,7 +2232,11 @@ class cluster_number_counts:
                 if cached is not None and len(cached[0]) == len(raw) and all(
                         p is cp for p, cp in zip(raw, cached[0])):
                     return cached[1]
-                sliced = tuple(jnp.asarray(p)[idx_bc] for p in raw)
+                # One bundled dispatch for all leaves (host-glue reduction);
+                # identity-keyed cache semantics unchanged.
+                sliced = _jit_tree_gather(
+                    tuple(jnp.asarray(p) for p in raw),
+                    jnp.asarray(idx_bc))
                 self._pc_slice_cache[cache_key] = (raw, sliced)
                 return sliced
 
@@ -2443,14 +2463,6 @@ class cluster_number_counts:
                         ci_g_jnp = jnp.array(ci_g)
                         ci_l_jnp = jnp.array(ci_l)
 
-                        # Gather per-cluster quantities
-                        mn = lnM_min[ci_g_jnp]
-                        mx = lnM_max[ci_g_jnp]
-                        ez = E_z_c[ci_g_jnp]
-                        da = D_A_c[ci_g_jnp]
-                        dl = D_l_CMB_c[ci_g_jnp]
-                        rc = rho_c_c[ci_g_jnp]
-
                         # Use cached obs-index mapping instead of rebuilding SR params
                         obs_idxs = self._bc_cached['pattern_obs_indices'][(s_idx, pattern)]
                         sub_obs = [self._bc_obs_list[i] for i in obs_idxs]
@@ -2460,16 +2472,20 @@ class cluster_number_counts:
                         sub_layer0_sr = tuple(all_layer0_sr[i] for i in obs_idxs)
                         sub_layer1_sr = tuple(all_layer1_sr[i] for i in obs_idxs)
 
-                        # Per-cluster patch indices for this group
-                        patch_sub = patch_clusters[ci_g_jnp]
+                        # Gather ALL per-cluster quantities for this group in
+                        # ONE compiled dispatch (was ~10 separate gathers).
+                        (mn, mx, ez, da, dl, rc, patch_sub, zc_g) = _jit_tree_gather(
+                            (lnM_min, lnM_max, E_z_c, D_A_c, D_l_CMB_c,
+                             rho_c_c, patch_clusters, z_clusters), ci_g_jnp)
 
                         # Covariance submatrix, per-cluster:
                         # all_cov_layer{0,1}[s_idx] has shape (n_bc, n_obs_s, n_obs_s).
                         # Restrict to this group's clusters and to the sub-pattern's
-                        # observables → (n_g, n_sub, n_sub).
+                        # observables → (n_g, n_sub, n_sub) — one dispatch.
                         si = jnp.array(list(pattern))
-                        sub_cov_l0 = all_cov_layer0[s_idx][ci_g_jnp][:, si][:, :, si]
-                        sub_cov_l1 = all_cov_layer1[s_idx][ci_g_jnp][:, si][:, :, si]
+                        sub_cov_l0, sub_cov_l1 = _jit_cov_subslice(
+                            all_cov_layer0[s_idx], all_cov_layer1[s_idx],
+                            ci_g_jnp, si)
 
                         # Cutoff: apply only if selection obs is first in sub-pattern
                         sel_at_0 = (len(sub_obs) > 0
@@ -2483,33 +2499,32 @@ class cluster_number_counts:
                             continue
 
                         if jit_info['type'] == '2d_split':
-                            set_obs = jnp.stack(
-                                [obs_data[sub_obs[j]][0][ci_g_jnp]
-                                 for j in range(2)], axis=1)
-                            zc = z_clusters[ci_g_jnp]
-                            # Per-cluster data: index into already-computed arrays
-                            sub_l0_pc = tuple(
-                                tuple(p[ci_g_jnp] for p in all_layer0_sr_pc[i])
-                                for i in obs_idxs)
-                            sub_l1_pc = tuple(
-                                tuple(p[ci_g_jnp] for p in all_layer1_sr_pc[i])
-                                for i in obs_idxs)
+                            # Per-cluster data + obs columns: ONE bundled
+                            # gather dispatch (was ~20 separate ones).
+                            (sub_l0_pc, sub_l1_pc, obs_cols) = _jit_tree_gather(
+                                (tuple(tuple(p for p in all_layer0_sr_pc[i])
+                                       for i in obs_idxs),
+                                 tuple(tuple(p for p in all_layer1_sr_pc[i])
+                                       for i in obs_idxs),
+                                 tuple(obs_data[sub_obs[j]][0]
+                                       for j in range(2))), ci_g_jnp)
+                            set_obs = jnp.stack(obs_cols, axis=1)
                             cpdf_sub = _dispatch_2d_split(
                                 jit_info['fwd_jit'], jit_info['conv_jit'],
-                                mn, mx, set_obs, ez, da, dl, rc, zc,
+                                mn, mx, set_obs, ez, da, dl, rc, zc_g,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_l0_pc, sub_l1_pc,
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val,
                                 patch_sub)
                         elif jit_info['type'] == 'generic':
-                            set_obs = jnp.stack(
-                                [obs_data[sub_obs[j]][0][ci_g_jnp]
-                                 for j in range(n_sub)], axis=1)
-                            zc = z_clusters[ci_g_jnp]
+                            obs_cols = _jit_tree_gather(
+                                tuple(obs_data[sub_obs[j]][0]
+                                      for j in range(n_sub)), ci_g_jnp)
+                            set_obs = jnp.stack(obs_cols, axis=1)
                             cpdf_sub = jit_info['jit_fn'](
                                 mn, mx, set_obs, ez, da, dl, rc,
-                                H0_jnp, D_CMB_jnp, gamma_jnp, zc,
+                                H0_jnp, D_CMB_jnp, gamma_jnp, zc_g,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val,
