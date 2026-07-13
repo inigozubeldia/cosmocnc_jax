@@ -2475,7 +2475,13 @@ class cluster_number_counts:
                     obs_vals_1l, has_obs_1l,
                     pref_sr_1l, l0_sr_1l, l0_pc_1l, cov_1l,
                     pre_nd_cpdfs)
-                if self._shard_mesh is not None and n_bc not in (
+                # bc sharding is SEPARATELY gated (default OFF): measured on
+                # v6e-4 2026-07-13, sharding the bc cluster axis is
+                # counterproductive (66 -> 92 ms; cross-device collectives
+                # dominate its small per-cluster work). tpu_shard alone
+                # shards only the abundance.
+                _shard_bc = bool(self.cnc_params.get("tpu_shard_bc", False))
+                if self._shard_mesh is not None and _shard_bc and n_bc not in (
                         self.cnc_params["n_points_data_lik"],
                         self.cnc_params["n_points"], self.cnc_params["n_z"]):
                     # Shard the cluster axis over the mesh. Generic size-keyed
@@ -2517,11 +2523,11 @@ class cluster_number_counts:
                     cpdf_with_hmf = cpdf_with_hmf[:n_bc]
                     lnM_grid = lnM_grid[:n_bc]
                 else:
-                    if self._shard_mesh is not None:
+                    if self._shard_mesh is not None and _shard_bc:
                         self.logger.warning(
-                            f"tpu_shard: bc cluster count n_bc={n_bc} collides "
-                            f"with a grid dimension — bc sharding SKIPPED "
-                            f"(abundance sharding unaffected).")
+                            f"tpu_shard_bc: bc cluster count n_bc={n_bc} "
+                            f"collides with a grid dimension — bc sharding "
+                            f"SKIPPED (abundance sharding unaffected).")
                     log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
                         *_bc_args)
             else:
