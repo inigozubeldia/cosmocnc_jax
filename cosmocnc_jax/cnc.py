@@ -2328,7 +2328,12 @@ class cluster_number_counts:
                 """
                 n_group = mn.shape[0]
                 _n_pad_g = 0
-                if self._shard_mesh is not None:
+                # Gated with tpu_shard_bc (default OFF): measured on v6e-4
+                # 2026-07-13, sharding this stage ALSO hurts (set_cpdfs 60->73,
+                # bc 86->106 ms) — the jit compute is only ~24 ms; the rest is
+                # host-side arg slicing/scatter, which sharding cannot help.
+                if self._shard_mesh is not None and bool(
+                        self.cnc_params.get("tpu_shard_bc", False)):
                     from jax.sharding import NamedSharding, PartitionSpec as P
                     D = self._shard_mesh.devices.size
                     _n_pad_g = (-n_group) % D
