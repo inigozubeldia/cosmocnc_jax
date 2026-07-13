@@ -1561,10 +1561,17 @@ class cluster_number_counts:
             self.D_l_CMB = jnp.asarray(self.cosmology.background_cosmology.angular_diameter_distance_z1z2(np.asarray(self.redshift_vec),self.cosmology.z_CMB).value)
             self.rho_c = jnp.asarray(self.cosmology.background_cosmology.critical_density(np.asarray(self.redshift_vec)).value*1000.*self.const.mpc**3/self.const.solar)
 
-        # Update cosmology-dependent per-cluster quantities (e.g., beta_avg for WL)
-        for sr in self.scaling_relations.values():
-            if hasattr(sr, 'update_beta_avg'):
-                sr.update_beta_avg(D_A=self.D_A, redshift_vec=self.redshift_vec)
+        # Update cosmology-dependent per-cluster quantities (e.g., beta_avg for WL).
+        # Device->host ONCE here: update_beta_avg works in numpy, and converting
+        # per SR object repeated the same D_A transfer (a ~1 ms host sync) per
+        # observable per eval.  [host-glue Stage 2e, 2026-07-13]
+        _sr_list = [sr for sr in self.scaling_relations.values()
+                    if hasattr(sr, 'update_beta_avg')]
+        if _sr_list:
+            _D_A_np = np.asarray(self.D_A)
+            _zvec_np = np.asarray(self.redshift_vec)
+            for sr in _sr_list:
+                sr.update_beta_avg(D_A=_D_A_np, redshift_vec=_zvec_np)
 
         #Evaluate the halo mass function
 
@@ -1647,7 +1654,8 @@ class cluster_number_counts:
                 if self.cnc_params.get("fft_mode", "exact") in ("tpu", "tpu_direct"):
                     # TPU path: FFT-free direct-quadrature sigma(R). The mcfit
                     # FFTLog forces complex128 and cannot lower on TPU.
-                    sigma_matrix, dsigma_matrix, R_matrix = batch_sigma_R_direct(
+                    # Jitted wrapper (one dispatch; hot path). [Stage 2e]
+                    sigma_matrix, dsigma_matrix, R_matrix = batch_sigma_R_direct_jit(
                         k_arr, pk_batch, M_vec, rho_m,
                         type_deriv=self.cnc_params["hmf_type_deriv"])
                 else:

@@ -453,7 +453,8 @@ class cosmology_model:
         if self.cnc_params.get("fft_mode", "exact") in ("tpu", "tpu_direct"):
             # TPU path: FFT-free direct-quadrature sigma (the mcfit FFTLog forces
             # complex128 and cannot lower on TPU).  [TPU-compat 2026-06-15]
-            from cosmocnc_jax.hmf import batch_sigma_R_direct
+            # Jitted wrapper (one dispatch; hot path). [Stage 2e]
+            from cosmocnc_jax.hmf import batch_sigma_R_direct_jit as batch_sigma_R_direct
             sigma_matrix, _, _ = batch_sigma_R_direct(
                 self._k_arr, pk_batch, jnp.asarray(M_phys_vec), rho_m,
                 type_deriv="analytical")

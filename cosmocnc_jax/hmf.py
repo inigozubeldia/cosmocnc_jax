@@ -566,6 +566,13 @@ def batch_sigma_R_direct(k_arr, pk_batch, M_vec, rho_m, type_deriv="analytical",
     return sigma, dsigma, R_matrix
 
 
+# Jitted wrapper: batch_sigma_R_direct runs on the per-eval hot path (get_hmf
+# sigma + the mass-conversion grid refresh) — eagerly it is an ~25-op dispatch
+# chain per call. Same function, one dispatch.  [host-glue Stage 2e, 2026-07-13]
+batch_sigma_R_direct_jit = jax.jit(
+    batch_sigma_R_direct, static_argnames=("type_deriv", "n_fine"))
+
+
 #Delta is w.r.t. mean
 
 def f_sigma(sigma, redshift=None, hmf_type="Tinker08", Delta=None, mass_definition="500c", other_params=None):
