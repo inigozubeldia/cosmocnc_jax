@@ -769,6 +769,31 @@ class cluster_number_counts:
         set_fft_c64(_fft_mode in ("tpu", "tpu_direct"))
         set_tpu_interp(_fft_mode == "tpu_direct")
 
+        # Optional multi-device sharding of one likelihood eval (tpu branch).
+        # cnc_params["tpu_shard"] = D (>1) shards the abundance patch axis and
+        # the backward-conv cluster axis over the first D local devices via
+        # NamedSharding placement (GSPMD computation-follows-data; the JIT'd
+        # kernels are untouched). Default 0 = off -> byte-identical behaviour.
+        # Padding is exact: patches pad with copies of patch 0 at skyfrac=0
+        # (healthy numerics, contribution exactly 0 — deliberately NOT tiny-
+        # sigma sentinels, see the 2026-07-10 fp32 lesson); clusters pad by
+        # repeating the last cluster, whose padded log-liks are sliced off.
+        # [tpu-shard Stage 2, 2026-07-13]
+        _n_shard = int(self.cnc_params.get("tpu_shard", 0) or 0)
+        self._shard_mesh = None
+        if _n_shard > 1:
+            _devs = jax.devices()
+            if len(_devs) < _n_shard:
+                self.logger.warning(
+                    f"tpu_shard={_n_shard} requested but only {len(_devs)} "
+                    f"devices visible — sharding DISABLED (never-silent).")
+            else:
+                from jax.sharding import Mesh
+                self._shard_mesh = Mesh(_devs[:_n_shard], ("d",))
+                self.logger.info(
+                    f"tpu_shard: 1 eval over {_n_shard} devices "
+                    f"({_devs[0].platform})")
+
         # Load the survey data
 
         path_to_survey = self.cnc_params["survey_sr"]
@@ -1764,13 +1789,59 @@ class cluster_number_counts:
         pad_abundance = jnp.bool_(self.cnc_params.get("pad_abundance", False))
         total_skyfrac = jnp.sum(skyfracs_arr)
 
-        (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
-         abundance_matrix_out, n_z_vec_out, n_tot_out,
-         self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
-            self.hmf_matrix, self.ln_M, self.obs_select_vec, self.redshift_vec,
-            all_layer_args_patched, all_deriv_args_patched,
-            all_scatters, all_cutoff_vals, all_apply_cutoffs,
-            sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac)
+        if self._shard_mesh is not None:
+            # Shard the patch axis over the mesh (exact: padded patches are
+            # copies of patch 0 with skyfrac=0 -> contribute exactly zero;
+            # see initialise). Shared inputs are replicated.
+            D = self._shard_mesh.devices.size
+            n_pad = (-self.n_patches) % D
+
+            def _pad_p(leaf):
+                if n_pad == 0:
+                    return leaf
+                return jnp.concatenate([leaf, leaf[:n_pad]], axis=0)
+
+            all_layer_args_patched = jax.tree_util.tree_map(
+                _pad_p, all_layer_args_patched)
+            all_deriv_args_patched = jax.tree_util.tree_map(
+                _pad_p, all_deriv_args_patched)
+            all_scatters = jax.tree_util.tree_map(_pad_p, all_scatters)
+            skyfracs_padded = jnp.concatenate(
+                [skyfracs_arr, jnp.zeros(n_pad, skyfracs_arr.dtype)]) \
+                if n_pad else skyfracs_arr
+
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            _sh = NamedSharding(self._shard_mesh, P("d"))
+            _rep = NamedSharding(self._shard_mesh, P())
+            _put_sh = lambda t: jax.tree_util.tree_map(
+                lambda a: jax.device_put(a, _sh), t)
+            all_layer_args_patched = _put_sh(all_layer_args_patched)
+            all_deriv_args_patched = _put_sh(all_deriv_args_patched)
+            all_scatters = _put_sh(all_scatters)
+            skyfracs_padded = jax.device_put(skyfracs_padded, _sh)
+            hmf_in = jax.device_put(self.hmf_matrix, _rep)
+
+            (abundance_tensor_p, n_obs_matrix_p, n_tot_vec_p,
+             abundance_matrix_out, n_z_vec_out, n_tot_out,
+             self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
+                hmf_in, self.ln_M, self.obs_select_vec, self.redshift_vec,
+                all_layer_args_patched, all_deriv_args_patched,
+                all_scatters, all_cutoff_vals, all_apply_cutoffs,
+                sigma_scatter_min, skyfracs_padded, pad_abundance,
+                total_skyfrac)
+            # Padded patches contribute exact zeros to the summed outputs;
+            # slice them off the per-patch outputs.
+            self.abundance_tensor = abundance_tensor_p[:self.n_patches]
+            self.n_obs_matrix = n_obs_matrix_p[:self.n_patches]
+            self.n_tot_vec = n_tot_vec_p[:self.n_patches]
+        else:
+            (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
+             abundance_matrix_out, n_z_vec_out, n_tot_out,
+             self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
+                self.hmf_matrix, self.ln_M, self.obs_select_vec, self.redshift_vec,
+                all_layer_args_patched, all_deriv_args_patched,
+                all_scatters, all_cutoff_vals, all_apply_cutoffs,
+                sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac)
 
         if self.cnc_params["compute_abundance_matrix"] == True:
             self.abundance_matrix = abundance_matrix_out
@@ -2392,18 +2463,67 @@ class cluster_number_counts:
             if bc_chunk <= 0 or n_bc <= bc_chunk:
                 # Full vmap: all clusters at once
                 pre_nd_cpdfs = _compute_all_set_cpdfs()
-                log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
+                _bc_args = (
                     lnM_min, lnM_max, all_obs_vals, all_has_obs,
                     hmf_z_c, skyfracs_clusters,
                     E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
                     H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters,
-                    shared_args[0], shared_args[1], shared_args[2],  # pref_sr, l0_sr, l1_sr
-                    *pc_args,  # per-cluster L0, L1
-                    *shared_args[3:],  # cov, cutoff, lnM bounds
+                    shared_args[0], shared_args[1], shared_args[2],
+                    *pc_args,
+                    *shared_args[3:],
                     patch_clusters,
                     obs_vals_1l, has_obs_1l,
                     pref_sr_1l, l0_sr_1l, l0_pc_1l, cov_1l,
                     pre_nd_cpdfs)
+                if self._shard_mesh is not None and n_bc not in (
+                        self.cnc_params["n_points_data_lik"],
+                        self.cnc_params["n_points"], self.cnc_params["n_z"]):
+                    # Shard the cluster axis over the mesh. Generic size-keyed
+                    # pad+shard: every array leaf with a size-n_bc axis 0 or 1
+                    # is padded (repeating the LAST cluster — exact: its padded
+                    # log-liks are sliced off below) and placed with that axis
+                    # on the mesh; everything else is replicated. The guard
+                    # above skips sharding (loudly) if n_bc collides with a
+                    # grid dimension, where the size heuristic would be
+                    # ambiguous.  [tpu-shard Stage 2, 2026-07-13]
+                    from jax.sharding import NamedSharding, PartitionSpec as P
+                    D = self._shard_mesh.devices.size
+                    n_pad_c = (-n_bc) % D
+                    _sh0 = NamedSharding(self._shard_mesh, P("d"))
+                    _sh1 = NamedSharding(self._shard_mesh, P(None, "d"))
+                    _rep = NamedSharding(self._shard_mesh, P())
+
+                    def _pad_shard(a):
+                        if not hasattr(a, "ndim") or a.ndim == 0:
+                            return a
+                        if a.ndim >= 1 and a.shape[0] == n_bc:
+                            if n_pad_c:
+                                a = jnp.concatenate(
+                                    [a, jnp.repeat(a[-1:], n_pad_c, axis=0)],
+                                    axis=0)
+                            return jax.device_put(a, _sh0)
+                        if a.ndim >= 2 and a.shape[1] == n_bc:
+                            if n_pad_c:
+                                a = jnp.concatenate(
+                                    [a, jnp.repeat(a[:, -1:], n_pad_c, axis=1)],
+                                    axis=1)
+                            return jax.device_put(a, _sh1)
+                        return jax.device_put(a, _rep)
+
+                    _bc_args = jax.tree_util.tree_map(_pad_shard, _bc_args)
+                    log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
+                        *_bc_args)
+                    log_liks = log_liks[:n_bc]
+                    cpdf_with_hmf = cpdf_with_hmf[:n_bc]
+                    lnM_grid = lnM_grid[:n_bc]
+                else:
+                    if self._shard_mesh is not None:
+                        self.logger.warning(
+                            f"tpu_shard: bc cluster count n_bc={n_bc} collides "
+                            f"with a grid dimension — bc sharding SKIPPED "
+                            f"(abundance sharding unaffected).")
+                    log_liks, cpdf_with_hmf, lnM_grid = self._allinone_bc_jit(
+                        *_bc_args)
             else:
                 # Chunked: process bc_chunk clusters at a time
                 log_liks_list = []

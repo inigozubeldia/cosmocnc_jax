@@ -79,6 +79,7 @@ cnc_params_default = {
     "mass_definition": "500c",
     "hmf_type_deriv": "numerical", #"analytical" or "numerical"
     "fft_mode": "auto", #"exact"(f64 FFT, GPU/CPU)|"tpu"(c64 FFT + FFT-free sigma)|"tpu_direct"(tpu + searchsorted-free abundance interps)|"auto"(by backend)
+    "tpu_shard": 0, #>1: shard one eval's abundance patch axis + bc cluster axis over that many local devices (GSPMD; exact padding). 0=off
     "power_spectrum_type": "cosmopower",
     "cosmo_amplitude_parameter": "sigma_8", #"sigma_8" or "A_s"
     "cosmo_param_density": "critical", #"physical" or "critical"

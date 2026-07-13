@@ -33,7 +33,7 @@ _CNC_PARAM_KEYS = (
     "obs_select_min", "obs_select_max", "z_min", "z_max",
     # cosmology / hmf
     "cosmology_tool", "M_min", "M_max", "M_min_extended", "M_min_cutoff",
-    "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv", "fft_mode",
+    "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv", "fft_mode", "tpu_shard",
     "power_spectrum_type", "cosmo_amplitude_parameter", "cosmo_param_density",
     "scalrel_type_deriv", "sigma_scatter_min", "interp_tinker", "Hubble_parameter",
     "cosmo_model", "class_sz_ndim_masses", "class_sz_concentration_parameter",
@@ -160,6 +160,7 @@ class cnc(classy):
     mass_definition : Optional[str] =  "500c"
     hmf_type_deriv : Optional[str] =  "numerical" #"analytical" or "numerical"
     fft_mode : Optional[str] = "auto" #"exact"|"tpu"|"tpu_direct"|"auto"; tpu: FFT-free sigma + c64 conv; tpu_direct: + searchsorted-free abundance interps
+    tpu_shard : Optional[int] = 0 #>1: shard one eval over that many local devices (abundance patches + bc clusters); 0=off
     power_spectrum_type : Optional[str] =  "cosmopower"
     cosmo_amplitude_parameter : Optional[str] =  "sigma_8" #"sigma_8" or "A_s"
     scalrel_type_deriv : Optional[str] =  "analytical" #"analytical" or "numerical"
