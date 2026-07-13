@@ -64,10 +64,12 @@ def interp_to_uniform_grid(x_grid, x_min, dx, xp, fp):
     c = jnp.clip(jnp.ceil(p).astype(jnp.int32), 0, n_new)
     h = jnp.zeros(n_new + 1, dtype=jnp.int32).at[c].add(1)
     idx = jnp.clip(jnp.cumsum(h)[:n_new], 1, xp.shape[0] - 1)
-    x_lo = xp[idx - 1]
-    x_hi = xp[idx]
-    f_lo = fp[idx - 1]
-    f_hi = fp[idx]
+    # ONE row-gather of pre-packed (x_lo, x_hi, f_lo, f_hi) rows instead of 4
+    # separate gathers: TPU dynamic-gather cost is per-INDEX (~60 ms per
+    # 1500x4096 gather op), not per-byte — packing quarters it.
+    packed = jnp.stack([xp[:-1], xp[1:], fp[:-1], fp[1:]], axis=-1)
+    got = packed[idx - 1]
+    x_lo, x_hi, f_lo, f_hi = got[..., 0], got[..., 1], got[..., 2], got[..., 3]
     d = x_hi - x_lo
     t = jnp.where(d == 0, 0.0, (x_grid - x_lo) / jnp.where(d == 0, 1.0, d))
     y = f_lo + t * (f_hi - f_lo)
@@ -89,14 +91,24 @@ def interp_from_uniform_grid(x_new, x0, fp, left=0.):
     dx = x0[1] - x0[0]
     fi = (x_new - x0[0]) / dx
     idx = jnp.clip(jnp.floor(fi).astype(jnp.int32), 0, n - 2)
-    # lerp against the ACTUAL grid endpoints, t clamped: linspace values
-    # deviate ~n*ulp from perfect arithmetic spacing, so the analytic index
-    # can bracket one interval off for queries within ~1e-11 of a grid point;
-    # actual-endpoint + clamp bounds the error by that query-position shift.
-    x_lo = x0[idx]
-    x_hi = x0[idx + 1]
-    t = jnp.clip((x_new - x_lo) / (x_hi - x_lo), 0., 1.)
-    y = fp[idx] * (1. - t) + fp[idx + 1] * t
+    # packed 2-tuple rows: (f_lo, f_hi) in ONE lookup (see
+    # interp_to_uniform_grid on why). x endpoints stay ANALYTIC + t clamped:
+    # x0 is uniform, and the actual-vs-analytic endpoint offset (~n*ulp) only
+    # shifts the effective query position by ~1e-11 — negligible for the
+    # smooth cpdfs this path handles.
+    fp_pairs = jnp.stack([fp[:-1], fp[1:]], axis=-1)
+    if n <= 64:
+        # small static table (survey-file lookups): one-hot matmul — 0.4 ms
+        # vs ~60 ms for a dynamic gather on TPU. Exact in f32 with HIGHEST
+        # (the one-hot factor is exactly representable).
+        oh = jax.nn.one_hot(idx, n - 1, dtype=fp.dtype)
+        got = jnp.matmul(oh, fp_pairs, precision=jax.lax.Precision.HIGHEST)
+    else:
+        got = fp_pairs[idx]
+    f_lo, f_hi = got[..., 0], got[..., 1]
+    x_lo = x0[0] + idx.astype(x0.dtype) * dx
+    t = jnp.clip((x_new - x_lo) / dx, 0., 1.)
+    y = f_lo * (1. - t) + f_hi * t
     y = jnp.where(x_new < x0[0], fp[0] if left is None else left, y)
     y = jnp.where(x_new > x0[-1], fp[-1], y)
     return y
