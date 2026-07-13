@@ -2319,7 +2319,42 @@ class cluster_number_counts:
                 sub_cov_l0, sub_cov_l1 are (n_group, 2, 2) — per-cluster
                 covariances for this pattern group. The conv_jit vmaps over
                 the leading cluster axis.
+
+                Under tpu_shard the group's cluster axis is sharded over the
+                mesh (this stage is abundance-like heavy per-cluster 2D work;
+                measured 60.5 ms of the bc's 66 on v6e-4). Padding repeats the
+                last cluster and the padded cpdfs are sliced off — exact.
+                [tpu-shard Stage 2c, 2026-07-13]
                 """
+                n_group = mn.shape[0]
+                _n_pad_g = 0
+                if self._shard_mesh is not None:
+                    from jax.sharding import NamedSharding, PartitionSpec as P
+                    D = self._shard_mesh.devices.size
+                    _n_pad_g = (-n_group) % D
+                    _g_sh0 = NamedSharding(self._shard_mesh, P("d"))
+                    _g_rep = NamedSharding(self._shard_mesh, P())
+
+                    def _pad_shard_g(a):
+                        if not hasattr(a, "ndim") or a.ndim == 0:
+                            return a
+                        if a.shape[0] == n_group:
+                            if _n_pad_g:
+                                a = jnp.concatenate(
+                                    [a, jnp.repeat(a[-1:], _n_pad_g, axis=0)],
+                                    axis=0)
+                            return jax.device_put(a, _g_sh0)
+                        return jax.device_put(a, _g_rep)
+
+                    (mn, mx, set_obs, ez, da, dl, rc, zc,
+                     sub_l0_pc, sub_l1_pc, sub_cov_l0, sub_cov_l1,
+                     patch_sub) = jax.tree_util.tree_map(
+                        _pad_shard_g,
+                        (mn, mx, set_obs, ez, da, dl, rc, zc,
+                         sub_l0_pc, sub_l1_pc, sub_cov_l0, sub_cov_l1,
+                         patch_sub))
+
+                _tp_g = _prof_mark("bc:set:pad+put", time.time())
                 (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
                  x_lin_0_start, x_lin_1_start,
                  dx0_arr, dx1_arr) = fwd_jit(
@@ -2328,6 +2363,7 @@ class cluster_number_counts:
                     sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                     sub_l0_pc, sub_l1_pc,
                     patch_sub)
+                _tp_g = _prof_mark("bc:set:fwd", _tp_g, r0)
 
                 # Per-cluster 2x2 inverse + normalisation (layer 1)
                 a1, b1, c1, d1 = (sub_cov_l1[:, 0, 0], sub_cov_l1[:, 0, 1],
@@ -2351,11 +2387,15 @@ class cluster_number_counts:
                 has_scatter = jnp.any(sub_cov_l0 != 0., axis=(1, 2))
 
                 obs_val_0 = set_obs[:, 0]
-                return conv_jit(
+                out = conv_jit(
                     r0, r1, kc0, kc1, x_l0_0, x_l0_1,
                     x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
                     obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
                     has_scatter, sub_apply_cut, sub_cut_val)
+                _prof_mark("bc:set:conv", _tp_g, out)
+                if _n_pad_g:
+                    out = out[:n_group]
+                return out
 
             def _compute_all_set_cpdfs(sl=None):
                 """Compute pre_nd_cpdfs for all sets with pattern-aware dispatch.
