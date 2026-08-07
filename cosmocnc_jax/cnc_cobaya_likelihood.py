@@ -46,6 +46,17 @@ class cnc_likelihood(Likelihood):
         # array has (and indexing it raises). Return a plain Python float.
         loglkl = float(theory)
 
+        if not np.isfinite(loglkl):
+            # A NaN here (e.g. an extreme-parameter region where the predicted
+            # cluster count overflows) must be rejected like any other
+            # low-probability point, not propagated as NaN: NaN comparisons in
+            # cobaya's Metropolis step are always False, so once a walker lands
+            # there it gets permanently stuck proposing-and-never-accepting
+            # until cobaya's own "stuck for N attempts" abort kills the whole
+            # MPI job (desonly_csd3, job 33074708, 2026-08-06: rank 0 hit
+            # N_tot=32,804, log_lik->nan, 23/103,187 accepted before the abort).
+            return -np.inf
+
         return loglkl
 
 
