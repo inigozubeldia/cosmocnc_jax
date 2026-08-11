@@ -84,6 +84,7 @@ _COSMO_INPUT_PARAMS = (
 _SR_INPUT_PARAMS = (
     # Planck SZiFi
     "A_szifi", "alpha_szifi", "sigma_lnq_szifi", "beta_szifi", "bias_sz",
+    "corr_lnq_wl",   # [2026-08-12] SZ-lnq x WL-lnM layer-0 scatter correlation
     # DES Y3 WL 10-parameter Magneticum calibration
     "b_wl_m", "s_wl_m", "b_wl_0", "b_wl_1", "b_wl_2", "b_wl_3",
     "s_wl_0", "s_wl_1", "s_wl_2", "s_wl_3",
@@ -467,6 +468,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"A_szifi")
         assign_parameter_value(scal_rel_params,params_values,"sigma_lnq_szifi")
         assign_parameter_value(scal_rel_params,params_values,"beta_szifi")
+        assign_parameter_value(scal_rel_params,params_values,"corr_lnq_wl")  # [2026-08-12]
 
         # DES Y3 WL — 10-parameter Magneticum B13 calibration (joint Gaussian
         # prior from wl_prior_magneticum_4sigma_trim.npz; see CLAUDE.md).
