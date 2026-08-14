@@ -19,6 +19,37 @@ TINKER08_c = jnp.array([1.19,1.27,1.34,1.45,1.58,1.80,1.97,2.24,2.44], dtype=jnp
 
 
 # =====================================================================
+# Tinker10 parameter arrays (Tinker et al. 2010, ApJ 724, 878, Table 4;
+# same Delta_mean grid as Tinker08). z=0 values; evolution per Eqs. 9-12.
+# =====================================================================
+
+TINKER10_ALPHA = jnp.array([0.368,0.363,0.385,0.389,0.393,0.365,0.379,0.355,0.327], dtype=jnp.float64)
+TINKER10_BETA0 = jnp.array([0.589,0.585,0.544,0.543,0.564,0.623,0.637,0.673,0.702], dtype=jnp.float64)
+TINKER10_GAMMA0 = jnp.array([0.864,0.922,0.987,1.09,1.20,1.34,1.50,1.68,1.81], dtype=jnp.float64)
+TINKER10_PHI0 = jnp.array([-0.729,-0.789,-0.910,-1.05,-1.20,-1.26,-1.45,-1.50,-1.49], dtype=jnp.float64)
+TINKER10_ETA0 = jnp.array([-0.243,-0.261,-0.261,-0.273,-0.278,-0.301,-0.301,-0.319,-0.336], dtype=jnp.float64)
+
+TINKER10_DELTA_C = 1.686          # peak-height threshold nu = delta_c / sigma
+TINKER10_Z_CAP = 3.0              # parameter evolution frozen beyond z=3 (T10 recommendation)
+
+
+# =====================================================================
+# Castro et al. 2023 (arXiv:2208.02174) multiplicity parameters —
+# ROCKSTAR calibration (their Table 4, primary). Virial masses,
+# cb power-spectrum convention, KS96 delta_c, BN98 Delta_vir.
+# =====================================================================
+
+CASTRO23_A1 = 0.7962
+CASTRO23_A2 = 0.1449
+CASTRO23_AZ = -0.0658
+CASTRO23_P1 = -0.5612
+CASTRO23_P2 = -0.4743
+CASTRO23_Q1 = 0.3688
+CASTRO23_Q2 = -0.2804
+CASTRO23_QZ = 0.0251
+
+
+# =====================================================================
 # Pure JAX functions for JIT compilation
 # =====================================================================
 
@@ -40,6 +71,78 @@ def f_sigma_jit(sigma, redshift, Delta, tinker_Delta, tinker_A, tinker_a, tinker
     c = jnp.interp(Delta_interp, tinker_Delta, tinker_c)
 
     return A*((sigma/b)**(-a)+1.)*jnp.exp(-c/sigma**2)
+
+
+def g_sigma_tinker10_jit(sigma, redshift, Delta, t10_Delta, t10_beta0, t10_gamma0,
+                         t10_phi0, t10_eta0, interp_log=True):
+    """Pure JAX Tinker10 multiplicity g(sigma) = nu*f(nu) (Tinker et al. 2010 Eq. 8).
+
+    f(nu) = alpha * [1 + (beta*nu)^(-2*phi)] * nu^(2*eta) * exp(-gamma*nu^2/2),
+    nu = delta_c/sigma with delta_c = 1.686. beta/gamma/phi/eta interpolated over
+    the Delta_mean table (log10 or linear per interp_log, mirroring the Tinker08
+    interp_tinker convention) and redshift-evolved per T10 Eqs. 9-12, with the
+    evolution frozen at z=3. alpha is the ANALYTIC normalisation (the closed form
+    of the integral constraint, as in the `hmf` package) evaluated with the
+    z-evolved parameters — smooth in z and self-consistent at every Delta.
+
+    Same dn/dlnM assembly slot as the Tinker08 f(sigma):
+        dn/dlnM = g(sigma) * (rho_m/M) * (-dln sigma/dlnM).
+    """
+    z_eff = jnp.minimum(redshift, TINKER10_Z_CAP)
+
+    Delta_interp = jnp.where(interp_log, jnp.log10(Delta), Delta)
+
+    beta = jnp.interp(Delta_interp, t10_Delta, t10_beta0) * (1. + z_eff)**0.20
+    gamma = jnp.interp(Delta_interp, t10_Delta, t10_gamma0) * (1. + z_eff)**(-0.01)
+    phi = jnp.interp(Delta_interp, t10_Delta, t10_phi0) * (1. + z_eff)**(-0.08)
+    eta = jnp.interp(Delta_interp, t10_Delta, t10_eta0) * (1. + z_eff)**0.27
+
+    # Analytic normalisation (closed form of the T10 integral constraint; args of
+    # Gamma are positive over the calibrated Delta/z range: eta+1/2 > 0 is NOT
+    # guaranteed (eta<0), so use gamma-function via lax.exp(gammaln) only where
+    # valid — over the T10 table eta in [-0.336, -0.243]*(1+z)^0.27 keeps
+    # eta+0.5 > 0 for z <= 3 (min value 0.5-0.336*4^0.27 ~ 0.011 > 0).
+    gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+    alpha = 1.0 / (
+        2.0**(eta - phi - 0.5) * beta**(-2.0*phi) * gamma**(-0.5 - eta)
+        * (2.0**phi * beta**(2.0*phi) * gamma_fn(eta + 0.5)
+           + gamma**phi * gamma_fn(0.5 + eta - phi))
+    )
+
+    nu = TINKER10_DELTA_C / sigma
+    f_nu = alpha * (1.0 + (beta*nu)**(-2.0*phi)) * nu**(2.0*eta) * jnp.exp(-gamma*nu**2/2.0)
+    return nu * f_nu
+
+
+def nuf_nu_castro23_jit(sigma, dlns_dlnR, Om_z_nonu):
+    """Pure JAX Castro et al. 2023 multiplicity nu*f(nu) (their Eqs. 3-4, 12-16).
+
+    Args:
+        sigma: sigma(R(M_vir), z)  [cb convention]
+        dlns_dlnR: dln(sigma)/dlnR at R(M_vir)  (negative)
+        Om_z_nonu: nu-free Omega_m(z) (cb), per the CCToolkit/Castorina convention
+
+    nu = delta_c(z)/sigma with the Kitayama & Suto (1996) eq. A.6 delta_c.
+    ROCKSTAR calibration parameters (module constants). Verified line-by-line
+    against CCToolkit multiplicity_function_castro23.
+    """
+    delta_c = (3.0/20.0) * (12.0*jnp.pi)**(2.0/3.0) * (1.0 + 0.012299*jnp.log10(Om_z_nonu))
+    nu = delta_c / sigma
+
+    aR = CASTRO23_A1 + CASTRO23_A2 * (dlns_dlnR + 0.6125)**2
+    qR = CASTRO23_Q1 + CASTRO23_Q2 * (dlns_dlnR + 0.5)
+    a = aR * Om_z_nonu**CASTRO23_AZ
+    p = CASTRO23_P1 + CASTRO23_P2 * (dlns_dlnR + 0.5)
+    q = qR * Om_z_nonu**CASTRO23_QZ
+
+    # A(p,q) normalisation (Castro23 Eq. 4). Gamma args: q/2 ~ 0.18 > 0 and
+    # -p + q/2 ~ 0.74 > 0 over the calibrated range.
+    gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+    A_pq = 1.0 / (2.0**(-0.5 - p + q/2.0) / jnp.sqrt(jnp.pi)
+                  * (2.0**p * gamma_fn(q/2.0) + gamma_fn(-p + q/2.0)))
+
+    return (A_pq * jnp.sqrt(2.0*a*nu**2/jnp.pi) * jnp.exp(-a*nu**2/2.0)
+            * (1.0 + 1.0/(a*nu**2)**p) * (nu*jnp.sqrt(a))**(q - 1.0))
 
 
 def get_sigma_M_from_arrays(M_vec, rho_m, R_vec, sigma_vec, dsigma_vec):
@@ -77,6 +180,47 @@ def compute_hmf_single_z(sigma, dsigmadR, R, M_vec, rho_m, redshift, Delta,
     return hmf
 
 
+def compute_hmf_single_z_tinker10(sigma, dsigmadR, R, M_vec, rho_m, redshift, Delta,
+                                  t10_Delta, t10_beta0, t10_gamma0, t10_phi0, t10_eta0,
+                                  volume_element_val, interp_log=True):
+    """Pure JAX: Tinker10 HMF for a single redshift. Mirrors
+    compute_hmf_single_z exactly, with g(sigma)=nu*f(nu) in the f(sigma) slot
+    (identical dn/dlnM convention)."""
+    dMdR = 4.*jnp.pi*rho_m*R**2
+
+    gsigma = g_sigma_tinker10_jit(sigma, redshift, Delta, t10_Delta, t10_beta0,
+                                  t10_gamma0, t10_phi0, t10_eta0, interp_log=interp_log)
+
+    hmf = -gsigma*rho_m/M_vec/dMdR*dsigmadR/sigma
+    M_eval = M_vec/1e14
+    hmf = hmf*1e14
+    hmf = hmf*M_eval
+    hmf = hmf * volume_element_val
+    return hmf
+
+
+def compute_hmf_single_z_castro23(sigma_vir, dlns_dlnR_vir, M_vir, jac_vir,
+                                  rho_m, Om_z_nonu, volume_element_val):
+    """Pure JAX: Castro23 HMF for a single redshift, on the M_200c grid.
+
+    dn/dln M_200c = [nu f(nu) * (rho_m/M_vir) * (-(1/3) dln sigma/dlnR)]_{M_vir(M_200c)}
+                    * dln M_vir/dln M_200c
+    (CCToolkit dn/dM assembly x the 200c->vir Jacobian; rho_m = comoving cb mean.)
+
+    Args (per z):
+        sigma_vir: sigma at R(M_vir(M_200c)), shape (n_points,)
+        dlns_dlnR_vir: dln sigma/dlnR at R(M_vir), shape (n_points,)
+        M_vir: M_vir(M_200c) in Msun, shape (n_points,)
+        jac_vir: dln M_vir/dln M_200c, shape (n_points,)
+        rho_m: scalar comoving mean (cb) matter density [Msun/Mpc^3]
+        Om_z_nonu: scalar nu-free Omega_m(z)
+        volume_element_val: scalar dV/dz/dOmega
+    """
+    nufnu = nuf_nu_castro23_jit(sigma_vir, dlns_dlnR_vir, Om_z_nonu)
+    hmf = nufnu * rho_m / M_vir * (-dlns_dlnR_vir/3.0) * jac_vir
+    return hmf * volume_element_val
+
+
 # Vectorized version over redshift dimension
 # interp_log is not vmapped (None) — it's a scalar bool shared across redshifts
 _compute_hmf_vmap_log = jax.vmap(
@@ -88,6 +232,69 @@ _compute_hmf_vmap_lin = jax.vmap(
     functools.partial(compute_hmf_single_z, interp_log=False),
     in_axes=(0, 0, 0, None, None, 0, 0,
              None, None, None, None, None, 0))
+
+
+_compute_hmf_t10_vmap_log = jax.vmap(
+    functools.partial(compute_hmf_single_z_tinker10, interp_log=True),
+    in_axes=(0, 0, 0, None, None, 0, 0,
+             None, None, None, None, None, 0))
+
+_compute_hmf_t10_vmap_lin = jax.vmap(
+    functools.partial(compute_hmf_single_z_tinker10, interp_log=False),
+    in_axes=(0, 0, 0, None, None, 0, 0,
+             None, None, None, None, None, 0))
+
+_compute_hmf_castro23_vmap = jax.vmap(
+    compute_hmf_single_z_castro23,
+    in_axes=(0, 0, 0, 0, None, 0, 0))
+
+
+def _interp_sigma_at_R_perz(sigma_row, dsigma_row, R_row, R_vec):
+    """Interpolate one z-row of raw sigma/dsigma (on the FFTLog R_vec grid) at a
+    per-z target R row (Castro23: R evaluated at M_vir(M_200c, z))."""
+    return jnp.interp(R_row, R_vec, sigma_row), jnp.interp(R_row, R_vec, dsigma_row)
+
+
+# module-level vmap (per the no-vmap-in-methods rule): per-z target R rows
+_vmap_interp_sigma_perz = jax.jit(jax.vmap(_interp_sigma_at_R_perz, in_axes=(0, 0, 0, None)))
+
+
+@functools.partial(jax.jit, static_argnums=(15,))
+def compute_hmf_matrix_tinker10_jit(sigma_matrix, dsigma_matrix, R_matrix, M_vec, rho_m,
+                                    redshift_vec, Delta_vec, volume_element_vec,
+                                    t10_Delta, t10_beta0, t10_gamma0, t10_phi0, t10_eta0,
+                                    _unused, M_min_cutoff, interp_log=True):
+    """JIT: full Tinker10 HMF matrix. Same shape contract as
+    compute_hmf_matrix_jit; `_unused` keeps the arg count symmetric for callers."""
+    if interp_log:
+        hmf_matrix = _compute_hmf_t10_vmap_log(sigma_matrix, dsigma_matrix, R_matrix,
+                                               M_vec, rho_m, redshift_vec, Delta_vec,
+                                               t10_Delta, t10_beta0, t10_gamma0,
+                                               t10_phi0, t10_eta0, volume_element_vec)
+    else:
+        hmf_matrix = _compute_hmf_t10_vmap_lin(sigma_matrix, dsigma_matrix, R_matrix,
+                                               M_vec, rho_m, redshift_vec, Delta_vec,
+                                               t10_Delta, t10_beta0, t10_gamma0,
+                                               t10_phi0, t10_eta0, volume_element_vec)
+
+    cutoff_mask = jnp.where(M_vec < M_min_cutoff, 0., 1.)
+    return hmf_matrix * cutoff_mask[jnp.newaxis, :]
+
+
+@jax.jit
+def compute_hmf_matrix_castro23_jit(sigma_vir_matrix, dlns_dlnR_vir_matrix,
+                                    M_vir_matrix, jac_vir_matrix, rho_m,
+                                    Om_z_nonu_vec, volume_element_vec,
+                                    M_vec, M_min_cutoff):
+    """JIT: full Castro23 HMF matrix on the M_200c grid.
+
+    Matrices are (n_z, n_points); M_vec is the M_200c grid (for the cutoff mask).
+    """
+    hmf_matrix = _compute_hmf_castro23_vmap(sigma_vir_matrix, dlns_dlnR_vir_matrix,
+                                            M_vir_matrix, jac_vir_matrix, rho_m,
+                                            Om_z_nonu_vec, volume_element_vec)
+    cutoff_mask = jnp.where(M_vec < M_min_cutoff, 0., 1.)
+    return hmf_matrix * cutoff_mask[jnp.newaxis, :]
 
 
 @functools.partial(jax.jit, static_argnums=(14,))
@@ -167,7 +374,7 @@ class halo_mass_function:
 
         self.const = constants()
 
-        if self.hmf_type == "Tinker08":
+        if self.hmf_type in ("Tinker08", "Tinker10", "Castro23"):
 
             if jax.config.jax_enable_x64:
                 self.rho_c_0 = self.cosmology.background_cosmology.critical_density(0.).value*self.const.mpc**3/self.const.solar*1e3
@@ -225,7 +432,7 @@ class halo_mass_function:
 
         if self.hmf_calc == "cnc":
 
-            if self.hmf_type == "Tinker08":
+            if self.hmf_type in ("Tinker08", "Tinker10"):
 
                 rho_m = self.rho_c_0*self.cosmology.cosmo_params["Om0"]
 
@@ -583,6 +790,25 @@ def f_sigma(sigma, redshift=None, hmf_type="Tinker08", Delta=None, mass_definiti
 
         f = A*((sigma/b)**(-a)+1.)*jnp.exp(-c/sigma**2)
 
+    elif hmf_type == "Tinker10":
+
+        # Non-JIT mirror of g_sigma_tinker10_jit (same formulas/constants;
+        # see that function's docstring). Kept for the serial eval_hmf path.
+        z_eff = jnp.minimum(redshift, TINKER10_Z_CAP)
+
+        beta = params.get_param("beta0", Delta)*(1.+z_eff)**0.20
+        gamma = params.get_param("gamma0", Delta)*(1.+z_eff)**(-0.01)
+        phi = params.get_param("phi0", Delta)*(1.+z_eff)**(-0.08)
+        eta = params.get_param("eta0", Delta)*(1.+z_eff)**0.27
+
+        gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+        alpha = 1.0/(2.0**(eta - phi - 0.5)*beta**(-2.0*phi)*gamma**(-0.5 - eta)
+                     *(2.0**phi*beta**(2.0*phi)*gamma_fn(eta + 0.5)
+                       + gamma**phi*gamma_fn(0.5 + eta - phi)))
+
+        nu = TINKER10_DELTA_C/sigma
+        f = nu*alpha*(1.0 + (beta*nu)**(-2.0*phi))*nu**(2.0*eta)*jnp.exp(-gamma*nu**2/2.0)
+
     return f
 
 
@@ -611,9 +837,23 @@ class hmf_params:
 
             self.params = {"A":A,"b":b,"a":a,"c":c,"Delta":Delta}
 
+        elif self.hmf_type == "Tinker10":
+
+            if other_params["interp_tinker"] == "log":
+
+                Delta = jnp.log10(jnp.array([200.,300.,400.,600.,800.,1200.,1600.,2400.,3200.]))
+
+            elif other_params["interp_tinker"] == "linear":
+
+                Delta = jnp.array([200.,300.,400.,600.,800.,1200.,1600.,2400.,3200.])
+
+            self.params = {"alpha0":TINKER10_ALPHA,"beta0":TINKER10_BETA0,
+                           "gamma0":TINKER10_GAMMA0,"phi0":TINKER10_PHI0,
+                           "eta0":TINKER10_ETA0,"Delta":Delta}
+
     def get_param(self, param, Delta):
 
-        if self.hmf_type == "Tinker08":
+        if self.hmf_type in ("Tinker08", "Tinker10"):
 
             if self.other_params["interp_tinker"] == "log":
 

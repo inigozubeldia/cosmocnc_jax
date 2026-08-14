@@ -539,6 +539,55 @@ class cosmology_model:
             M_200c_vec, z_tab, rho_c_z_tab, Om_z_tab, D_z_tab,
             logM_grid_for_sigma, sigma_grid)
 
+    def compute_log_mvir_over_m200c_grid(self, z_tab, lnM_tab_phys_1e14,
+                                         n_sigma_grid=200, margin=2.0):
+        """JAX-native (z, lnM_200c) → ln(M_vir/M_200c) grid via the same
+        sigma-based-B13 virial path as compute_log_m500c_over_m200c_grid
+        (exposes the M_vir intermediate; Castro23 HMF support). Identical
+        argument/units contract as that method.
+        """
+        from cosmocnc_jax.mass_conversion import (
+            log_mvir_over_m200c_grid_virial,
+            growth_factor_carroll_press_turner,
+        )
+        from cosmocnc_jax.hmf import constants as _hmf_constants
+
+        z_tab = jnp.asarray(z_tab)
+        lnM_tab_phys_1e14 = jnp.asarray(lnM_tab_phys_1e14)
+        M_200c_vec = jnp.exp(lnM_tab_phys_1e14) * 1e14
+
+        lnM_min = lnM_tab_phys_1e14[0] + jnp.log(1e14) - jnp.log(margin)
+        lnM_max = lnM_tab_phys_1e14[-1] + jnp.log(1e14) + jnp.log(margin)
+        logM_grid_for_sigma = jnp.linspace(lnM_min, lnM_max, n_sigma_grid)
+        M_for_sigma = jnp.exp(logM_grid_for_sigma)
+
+        sigma_grid = self._compute_sigma_M_at_z(M_for_sigma, z_tab)
+
+        Om0 = self._Om0
+        OL0 = self._Ol0
+        Or0 = self._Or0
+        D_z_tab = growth_factor_carroll_press_turner(z_tab, Om0, OL0)
+
+        z1 = 1.0 + z_tab
+        Ez2 = Om0 * z1**3 + OL0 + Or0 * z1**4
+        Om_z_tab = Om0 * z1**3 / Ez2
+
+        if jax.config.jax_enable_x64:
+            rho_c_0_in_Msun_Mpc3 = (
+                self.background_cosmology.critical_density(0.).value
+                * _hmf_constants().mpc**3 / _hmf_constants().solar * 1e3
+            )
+        else:
+            rho_c_0_in_Msun_Mpc3 = (
+                self.background_cosmology.critical_density(0.).value
+                * 1e3 * (_hmf_constants().mpc**3 / _hmf_constants().solar)
+            )
+        rho_c_z_tab = rho_c_0_in_Msun_Mpc3 * Ez2
+
+        return log_mvir_over_m200c_grid_virial(
+            M_200c_vec, z_tab, rho_c_z_tab, Om_z_tab, D_z_tab,
+            logM_grid_for_sigma, sigma_grid)
+
     def _Omega_m_z_nonu(self, z):
         """Omega_m(z) without neutrinos — for Delta conversion.
         Matches classy.pyx get_delta_mean_from_delta_crit_at_z (lines 3266-3275)."""

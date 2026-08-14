@@ -225,6 +225,43 @@ def _m200c_to_m500c_one(M_200c, z, rho_c_z, Om_z, D_z,
 
 
 @jax.jit
+def _m200c_to_mvir_one(M_200c, rho_c_z, Om_z, D_z,
+                       logM_grid_for_sigma, sigma_grid_at_z):
+    """Single-point M_200c → M_vir (the intermediate of the 500c path).
+
+    Same Newton solve as _m200c_to_m500c_one's first stage: BN98
+    Delta_c_vir(Om_z) wrt critical + sigma-based B13 c_vir.
+    All arguments scalars; sigma_grid_at_z is (n_logM,).
+    """
+    delta_c_vir = delta_c_virial(Om_z)
+    R_DEL = (3.0 * M_200c / (4.0 * jnp.pi * 200.0 * rho_c_z))**(1.0/3.0)
+    return _solve_M_vir_from_M_DEL(
+        M_200c, R_DEL, rho_c_z, delta_c_vir,
+        logM_grid_for_sigma, sigma_grid_at_z, D_z)
+
+
+def log_mvir_over_m200c_grid_virial(M_200c_vec, z_tab, rho_c_z_tab,
+                                    Om_z_tab, D_z_tab,
+                                    logM_grid_for_sigma, sigma_grid):
+    """Build the (z, M_200c) → ln(M_vir/M_200c) grid (Castro23 HMF support).
+
+    Same argument contract as log_m500c_over_m200c_grid_virial; exposes the
+    M_vir intermediate of the certified virial path instead of completing the
+    conversion to M_500c.
+
+    Returns:
+        ln(M_vir/M_200c), shape (n_z, n_m).
+    """
+    def at_z(rho_c, Om, D, sigma_row):
+        def at_M(M_200c):
+            M_vir = _m200c_to_mvir_one(M_200c, rho_c, Om, D,
+                                       logM_grid_for_sigma, sigma_row)
+            return jnp.log(M_vir / M_200c)
+        return jax.vmap(at_M)(M_200c_vec)
+
+    return jax.vmap(at_z, in_axes=(0, 0, 0, 0))(rho_c_z_tab, Om_z_tab, D_z_tab, sigma_grid)
+
+
 def log_m500c_over_m200c_grid_virial(M_200c_vec, z_tab, rho_c_z_tab,
                                      Om_z_tab, D_z_tab,
                                      logM_grid_for_sigma, sigma_grid):

@@ -75,7 +75,7 @@ cnc_params_default = {
     "M_min_extended": None,
     "M_min_cutoff": None,
     "hmf_calc": "cnc", # "cnc" (JAX, required for classy_sz_jax), "hmf", "MiraTitan"
-    "hmf_type": "Tinker08",
+    "hmf_type": "Tinker08", # "Tinker08", "Tinker10", or "Castro23" (Castro23: classy_sz_jax only, virial-mass HMF via the B13 200c->vir conversion)
     "mass_definition": "500c",
     "hmf_type_deriv": "numerical", #"analytical" or "numerical"
     "fft_mode": "auto", #"exact"(f64 FFT, GPU/CPU)|"tpu"(c64 FFT + FFT-free sigma)|"tpu_direct"(tpu + searchsorted-free abundance interps)|"auto"(by backend)

@@ -1520,7 +1520,7 @@ class cluster_number_counts:
 
         if self.cnc_params["hmf_calc"] == "cnc" or self.cnc_params["hmf_calc"] == "hmf":
 
-            if self.cnc_params["hmf_calc"] == "cnc" and self.cnc_params["hmf_type"] == "Tinker08":
+            if self.cnc_params["hmf_calc"] == "cnc" and self.cnc_params["hmf_type"] in ("Tinker08", "Tinker10", "Castro23"):
 
                 # Precompute sigma arrays for all redshifts using mcfit JAX backend
                 M_vec = jnp.exp(jnp.linspace(jnp.log(self.cnc_params["M_min"]),jnp.log(self.cnc_params["M_max"]),self.cnc_params["n_points"]))
@@ -1619,12 +1619,60 @@ class cluster_number_counts:
 
                 M_min_cutoff = self.cnc_params["M_min_cutoff"] if self.cnc_params["M_min_cutoff"] is not None else -1.0
 
-                # JIT-compiled HMF computation
-                self.hmf_matrix = compute_hmf_matrix_jit(
-                    sigma_matrix, dsigma_matrix, R_matrix,
-                    M_vec, rho_m, self.redshift_vec, Delta_vec, volume_element_vec,
-                    tinker_Delta, TINKER08_A, TINKER08_a, TINKER08_b, TINKER08_c,
-                    M_min_cutoff, interp_log)
+                if self.cnc_params["hmf_type"] == "Tinker08":
+
+                    # JIT-compiled HMF computation
+                    self.hmf_matrix = compute_hmf_matrix_jit(
+                        sigma_matrix, dsigma_matrix, R_matrix,
+                        M_vec, rho_m, self.redshift_vec, Delta_vec, volume_element_vec,
+                        tinker_Delta, TINKER08_A, TINKER08_a, TINKER08_b, TINKER08_c,
+                        M_min_cutoff, interp_log)
+
+                elif self.cnc_params["hmf_type"] == "Tinker10":
+
+                    # Same sigma machinery + Delta_mean(z) convention; Tinker10
+                    # g(sigma)=nu f(nu) with analytic-normalisation alpha.
+                    self.hmf_matrix = compute_hmf_matrix_tinker10_jit(
+                        sigma_matrix, dsigma_matrix, R_matrix,
+                        M_vec, rho_m, self.redshift_vec, Delta_vec, volume_element_vec,
+                        tinker_Delta, TINKER10_BETA0, TINKER10_GAMMA0,
+                        TINKER10_PHI0, TINKER10_ETA0,
+                        0.0, M_min_cutoff, interp_log)
+
+                elif self.cnc_params["hmf_type"] == "Castro23":
+
+                    # Castro et al. 2023 virial-mass HMF on the M_200c grid.
+                    # Needs the classy_sz_jax fast path (nu-free Omega_m(z),
+                    # sigma grids, B13 virial conversion machinery).
+                    if self.cnc_params["cosmology_tool"] != "classy_sz_jax":
+                        raise ValueError("hmf_type='Castro23' requires cosmology_tool='classy_sz_jax'")
+                    if self.cnc_params.get("fft_mode", "exact") in ("tpu", "tpu_direct"):
+                        raise ValueError("hmf_type='Castro23' is not supported with fft_mode='tpu'")
+
+                    # ln(M_vir/M_200c) grid + Jacobian dlnM_vir/dlnM_200c
+                    lnM_grid = jnp.log(M_vec/1e14)
+                    log_ratio = cosmo.compute_log_mvir_over_m200c_grid(
+                        self.redshift_vec, lnM_grid)                     # (n_z, n_points)
+                    dlnM = (lnM_grid[-1] - lnM_grid[0]) / (self.cnc_params["n_points"] - 1)
+                    jac_vir_matrix = 1.0 + jnp.gradient(log_ratio, dlnM, axis=1)
+                    M_vir_matrix = M_vec[None, :] * jnp.exp(log_ratio)   # Msun
+
+                    # sigma and dsigma/dR at R(M_vir(M_200c, z)): interpolate the
+                    # RAW per-z FFTLog rows at the per-z R_vir targets.
+                    vmap_sigma_fn, _, R_vec_raw = self._batch_sigma_fns
+                    sigma_raw_batch, dsigma_raw_batch = vmap_sigma_fn(pk_batch)
+                    R_vir_matrix = (3.0*M_vir_matrix/(4.0*jnp.pi*rho_m))**(1.0/3.0)
+                    sigma_vir_matrix, dsigma_vir_matrix = _vmap_interp_sigma_perz(
+                        sigma_raw_batch, dsigma_raw_batch, R_vir_matrix, R_vec_raw)
+                    dlns_dlnR_vir_matrix = R_vir_matrix * dsigma_vir_matrix / sigma_vir_matrix
+
+                    Om_z_nonu_vec = cosmo._Omega_m_z_nonu(self.redshift_vec)
+
+                    self.hmf_matrix = compute_hmf_matrix_castro23_jit(
+                        sigma_vir_matrix, dlns_dlnR_vir_matrix,
+                        M_vir_matrix, jac_vir_matrix, rho_m,
+                        Om_z_nonu_vec, volume_element_vec,
+                        M_vec, M_min_cutoff)
 
                 self.ln_M = jnp.log(M_vec/1e14)
 
