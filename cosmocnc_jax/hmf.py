@@ -255,8 +255,9 @@ def _interp_sigma_at_R_perz(sigma_row, dsigma_row, R_row, R_vec):
     return jnp.interp(R_row, R_vec, sigma_row), jnp.interp(R_row, R_vec, dsigma_row)
 
 
-# module-level vmap (per the no-vmap-in-methods rule): per-z target R rows
-_vmap_interp_sigma_perz = jax.jit(jax.vmap(_interp_sigma_at_R_perz, in_axes=(0, 0, 0, None)))
+# module-level vmap (per the no-vmap-in-methods rule): per-z target R rows.
+# Public (no leading underscore): cnc.py consumes it via `from .hmf import *`.
+vmap_interp_sigma_perz = jax.jit(jax.vmap(_interp_sigma_at_R_perz, in_axes=(0, 0, 0, None)))
 
 
 @functools.partial(jax.jit, static_argnums=(15,))

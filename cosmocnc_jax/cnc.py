@@ -5,7 +5,7 @@ import numpy as np
 # scipy imports removed -- all replaced with JAX equivalents
 from .cosmo import *
 from .hmf import *
-from .hmf import _vmap_interp_sigma_perz   # underscore names are excluded from star-imports
+from .hmf import vmap_interp_sigma_perz   # explicit: documents the Castro23 dependency
 from .sr import *
 from .cat import *
 from .params import *
@@ -1649,6 +1649,11 @@ class cluster_number_counts:
                         raise ValueError("hmf_type='Castro23' requires cosmology_tool='classy_sz_jax'")
                     if self.cnc_params.get("fft_mode", "exact") in ("tpu", "tpu_direct"):
                         raise ValueError("hmf_type='Castro23' is not supported with fft_mode='tpu'")
+                    if self.cnc_params["mass_definition"] != "200c":
+                        # the 200c->vir conversion below assumes the internal
+                        # mass grid is M_200c (the production convention)
+                        raise ValueError("hmf_type='Castro23' requires mass_definition='200c' "
+                                         f"(got {self.cnc_params['mass_definition']!r})")
 
                     # ln(M_vir/M_200c) grid + Jacobian dlnM_vir/dlnM_200c
                     lnM_grid = jnp.log(M_vec/1e14)
@@ -1663,7 +1668,7 @@ class cluster_number_counts:
                     vmap_sigma_fn, _, R_vec_raw = self._batch_sigma_fns
                     sigma_raw_batch, dsigma_raw_batch = vmap_sigma_fn(pk_batch)
                     R_vir_matrix = (3.0*M_vir_matrix/(4.0*jnp.pi*rho_m))**(1.0/3.0)
-                    sigma_vir_matrix, dsigma_vir_matrix = _vmap_interp_sigma_perz(
+                    sigma_vir_matrix, dsigma_vir_matrix = vmap_interp_sigma_perz(
                         sigma_raw_batch, dsigma_raw_batch, R_vir_matrix, R_vec_raw)
                     dlns_dlnR_vir_matrix = R_vir_matrix * dsigma_vir_matrix / sigma_vir_matrix
 

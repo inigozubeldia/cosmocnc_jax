@@ -224,7 +224,6 @@ def _m200c_to_m500c_one(M_200c, z, rho_c_z, Om_z, D_z,
     return M_500c
 
 
-@jax.jit
 def _m200c_to_mvir_one(M_200c, rho_c_z, Om_z, D_z,
                        logM_grid_for_sigma, sigma_grid_at_z):
     """Single-point M_200c → M_vir (the intermediate of the 500c path).
@@ -240,6 +239,7 @@ def _m200c_to_mvir_one(M_200c, rho_c_z, Om_z, D_z,
         logM_grid_for_sigma, sigma_grid_at_z, D_z)
 
 
+@jax.jit
 def log_mvir_over_m200c_grid_virial(M_200c_vec, z_tab, rho_c_z_tab,
                                     Om_z_tab, D_z_tab,
                                     logM_grid_for_sigma, sigma_grid):
@@ -262,6 +262,7 @@ def log_mvir_over_m200c_grid_virial(M_200c_vec, z_tab, rho_c_z_tab,
     return jax.vmap(at_z, in_axes=(0, 0, 0, 0))(rho_c_z_tab, Om_z_tab, D_z_tab, sigma_grid)
 
 
+@jax.jit
 def log_m500c_over_m200c_grid_virial(M_200c_vec, z_tab, rho_c_z_tab,
                                      Om_z_tab, D_z_tab,
                                      logM_grid_for_sigma, sigma_grid):
