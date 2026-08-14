@@ -5,6 +5,7 @@ import numpy as np
 # scipy imports removed -- all replaced with JAX equivalents
 from .cosmo import *
 from .hmf import *
+from .hmf import _vmap_interp_sigma_perz   # underscore names are excluded from star-imports
 from .sr import *
 from .cat import *
 from .params import *
