@@ -1688,6 +1688,8 @@ class cluster_number_counts:
                     self.castro_jac_vir_matrix = jac_vir_matrix
                     self.castro_volume_element_vec = volume_element_vec
                     self.castro_dlns_matrix = dlns_dlnR_vir_matrix
+                    self.castro_sigma_vir_matrix = sigma_vir_matrix
+                    self.castro_Om_z_nonu_vec = Om_z_nonu_vec
 
                 self.ln_M = jnp.log(M_vec/1e14)
 
