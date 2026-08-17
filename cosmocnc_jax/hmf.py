@@ -97,12 +97,12 @@ def g_sigma_tinker10_jit(sigma, redshift, Delta, t10_Delta, t10_beta0, t10_gamma
     phi = jnp.interp(Delta_interp, t10_Delta, t10_phi0) * (1. + z_eff)**(-0.08)
     eta = jnp.interp(Delta_interp, t10_Delta, t10_eta0) * (1. + z_eff)**0.27
 
-    # Analytic normalisation (closed form of the T10 integral constraint; args of
-    # Gamma are positive over the calibrated Delta/z range: eta+1/2 > 0 is NOT
-    # guaranteed (eta<0), so use gamma-function via lax.exp(gammaln) only where
-    # valid — over the T10 table eta in [-0.336, -0.243]*(1+z)^0.27 keeps
-    # eta+0.5 > 0 for z <= 3 (min value 0.5-0.336*4^0.27 ~ 0.011 > 0).
-    gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+    # Analytic normalisation (closed form of the T10 integral constraint).
+    # SIGNED gamma function (gammasgn * exp(gammaln)): exact for any argument
+    # sign — over the T10 table the args stay positive (eta+0.5 >= 0.011 at the
+    # z=3 cap), but the signed form is used everywhere for domain robustness
+    # (audit 2026-08-15: bare exp(gammaln) silently returns |Gamma|).
+    gamma_fn = lambda x: jax.scipy.special.gammasgn(x) * jnp.exp(jax.scipy.special.gammaln(x))
     alpha = 1.0 / (
         2.0**(eta - phi - 0.5) * beta**(-2.0*phi) * gamma**(-0.5 - eta)
         * (2.0**phi * beta**(2.0*phi) * gamma_fn(eta + 0.5)
@@ -135,9 +135,12 @@ def nuf_nu_castro23_jit(sigma, dlns_dlnR, Om_z_nonu):
     p = CASTRO23_P1 + CASTRO23_P2 * (dlns_dlnR + 0.5)
     q = qR * Om_z_nonu**CASTRO23_QZ
 
-    # A(p,q) normalisation (Castro23 Eq. 4). Gamma args: q/2 ~ 0.18 > 0 and
-    # -p + q/2 ~ 0.74 > 0 over the calibrated range.
-    gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+    # A(p,q) normalisation (Castro23 Eq. 4). SIGNED gamma (gammasgn*exp(gammaln)):
+    # -p + q/2 goes NEGATIVE for dln(sigma)/dlnR < -2.7317 (where the Castro
+    # normalisation integral itself diverges — outside the model's physical
+    # domain, but the formula must match the signed CCToolkit/scipy Gamma there;
+    # audit 2026-08-15 E1 finding: bare exp(gammaln) returned |Gamma|).
+    gamma_fn = lambda x: jax.scipy.special.gammasgn(x) * jnp.exp(jax.scipy.special.gammaln(x))
     A_pq = 1.0 / (2.0**(-0.5 - p + q/2.0) / jnp.sqrt(jnp.pi)
                   * (2.0**p * gamma_fn(q/2.0) + gamma_fn(-p + q/2.0)))
 
@@ -802,7 +805,7 @@ def f_sigma(sigma, redshift=None, hmf_type="Tinker08", Delta=None, mass_definiti
         phi = params.get_param("phi0", Delta)*(1.+z_eff)**(-0.08)
         eta = params.get_param("eta0", Delta)*(1.+z_eff)**0.27
 
-        gamma_fn = lambda x: jnp.exp(jax.scipy.special.gammaln(x))
+        gamma_fn = lambda x: jax.scipy.special.gammasgn(x) * jnp.exp(jax.scipy.special.gammaln(x))
         alpha = 1.0/(2.0**(eta - phi - 0.5)*beta**(-2.0*phi)*gamma**(-0.5 - eta)
                      *(2.0**phi*beta**(2.0*phi)*gamma_fn(eta + 0.5)
                        + gamma**phi*gamma_fn(0.5 + eta - phi)))

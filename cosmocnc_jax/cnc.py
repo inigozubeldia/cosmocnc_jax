@@ -1681,10 +1681,13 @@ class cluster_number_counts:
                         M_vec, M_min_cutoff)
 
                     # audit/debug attributes (external cross-checks: dn/dlnM_vir
-                    # = hmf_matrix / (volume_element_vec[:,None] * jac_vir_matrix))
+                    # = hmf_matrix / (volume_element_vec[:,None] * jac_vir_matrix));
+                    # castro_dlns_matrix also monitors the distance to the model's
+                    # normalisable-domain boundary dln(sigma)/dlnR = -2.7317
                     self.castro_M_vir_matrix = M_vir_matrix
                     self.castro_jac_vir_matrix = jac_vir_matrix
                     self.castro_volume_element_vec = volume_element_vec
+                    self.castro_dlns_matrix = dlns_dlnR_vir_matrix
 
                 self.ln_M = jnp.log(M_vec/1e14)
 
