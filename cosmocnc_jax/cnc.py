@@ -649,7 +649,8 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
         where:
             all_layer_args: tuple of N tuples (layer k args = prefactors + sr_params)
             all_deriv_args: tuple of N tuples
-            all_scatters: tuple of N scalars
+            all_scatters: tuple of N scalars (per (patch, z) after the two
+                enclosing vmaps; [z-dep selection scatter 2026-08-18])
             all_cutoff_vals: tuple of N scalars
             all_apply_cutoffs: tuple of N booleans
     """
@@ -1319,7 +1320,9 @@ class cluster_number_counts:
             0, None, None,             # hmf_row, ln_M, obs_select_vec
             z_layer_args_axes,          # all_layer_args
             z_deriv_axes,               # all_deriv_args
-            tuple([None]*n_layers_sel), # all_scatters
+            tuple([0]*n_layers_sel),    # all_scatters — per-z (axis 0 of the
+                                        # (n_z,) slice each patch contributes;
+                                        # [z-dep selection scatter 2026-08-18])
             tuple([None]*n_layers_sel), # all_cutoff_vals
             tuple([None]*n_layers_sel), # all_apply_cutoffs
             None, None, None,           # sigma_scatter_min, skyfrac, pad_abundance
@@ -1775,15 +1778,30 @@ class cluster_number_counts:
                 all_deriv_args_list.append(())
         all_deriv_args = tuple(all_deriv_args_list)
 
-        # Scatter per layer per patch: tuple of n_layers arrays each (n_patches,)
+        # Scatter per layer per patch per z: tuple of n_layers arrays each
+        # (n_patches, n_z). [z-dep selection scatter 2026-08-18] get_cov is
+        # called with the redshift grid via the established other_params['zc']
+        # idiom (same interface as the per-cluster and stacked paths); scatter
+        # classes whose sigma is z-independent ignore 'zc' and return a scalar,
+        # which is broadcast across z — bit-identical to the previous
+        # per-patch-scalar behaviour. z-dependent classes (e.g. sigma_lnq(z))
+        # return an (n_z,) array and each z-slice is convolved with its own
+        # kernel (the abundance kernel is per-z already; only the vmap axis
+        # changed). Survey-agnostic: no observable-specific dispatch here.
+        zc_grid_np = np.asarray(self.redshift_vec, dtype=np.float64)
+        n_zv = len(zc_grid_np)
         all_scatters_list = []
         for k in range(self._n_layers_sel):
-            scatter_per_patch = jnp.array([
-                jnp.sqrt(self.scatter.get_cov(
+            rows = []
+            for i in range(self.n_patches):
+                cov_ki = self.scatter.get_cov(
                     observable1=obs_select, observable2=obs_select,
-                    layer=k, patch1=i, patch2=i))
-                for i in range(self.n_patches)])
-            all_scatters_list.append(scatter_per_patch)
+                    layer=k, patch1=i, patch2=i,
+                    other_params={"zc": zc_grid_np})
+                rows.append(jnp.broadcast_to(
+                    jnp.sqrt(jnp.atleast_1d(jnp.asarray(cov_ki, dtype=jnp.float64))),
+                    (n_zv,)))
+            all_scatters_list.append(jnp.stack(rows))
         all_scatters = tuple(all_scatters_list)
 
         # Cutoff per layer
