@@ -88,6 +88,7 @@ _SR_INPUT_PARAMS = (
     "alpha2_szifi",  # [2026-08-18] running of the SZ mass exponent (curv model)
     "beta2_szifi",   # [2026-08-18] running of the SZ E(z) exponent (curv model)
     "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq (sigz model)
+    "dalpha_szifi",  # [2026-08-19] faint-end slope offset (two-slope model)
     # DES Y3 WL 10-parameter Magneticum calibration
     "b_wl_m", "s_wl_m", "b_wl_0", "b_wl_1", "b_wl_2", "b_wl_3",
     "s_wl_0", "s_wl_1", "s_wl_2", "s_wl_3",
@@ -475,6 +476,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"alpha2_szifi")   # [2026-08-18]
         assign_parameter_value(scal_rel_params,params_values,"beta2_szifi")    # [2026-08-18]
         assign_parameter_value(scal_rel_params,params_values,"gamma_z_szifi")  # [2026-08-18]
+        assign_parameter_value(scal_rel_params,params_values,"dalpha_szifi")   # [2026-08-19]
 
         # DES Y3 WL — 10-parameter Magneticum B13 calibration (joint Gaussian
         # prior from wl_prior_magneticum_4sigma_trim.npz; see CLAUDE.md).
