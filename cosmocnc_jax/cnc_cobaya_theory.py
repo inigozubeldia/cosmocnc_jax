@@ -90,6 +90,9 @@ _SR_INPUT_PARAMS = (
     "beta2_szifi",   # [2026-08-18] running of the SZ E(z) exponent (curv model)
     "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq (sigz model)
     "dalpha_szifi",  # [2026-08-19] faint-end slope offset (two-slope model)
+    "q_cutoff",      # [2026-08-27] selection cutoff as a sampled nuisance; when not
+                     # sampled, calculate() falls back to the cnc_params mirror
+    "dof",           # [2026-08-27] same, for optional dof-marginalization variants
     # DES Y3 WL 10-parameter Magneticum calibration
     "b_wl_m", "s_wl_m", "b_wl_0", "b_wl_1", "b_wl_2", "b_wl_3",
     "s_wl_0", "s_wl_1", "s_wl_2", "s_wl_3",
@@ -533,6 +536,11 @@ class cnc(classy):
         # updating scaling relations params that are not varied in mcmc, but passed in input
         scal_rel_params['dof'] = self.cnc.cnc_params["dof"]
         scal_rel_params['q_cutoff'] = self.cnc.cnc_params["q_cutoff"]
+        # [2026-08-27] q_cutoff (and dof) as SAMPLED nuisances: a sampled value
+        # overrides the cnc_params mirror above; absent from the run's sampled
+        # params, the mirror stands and behaviour is unchanged.
+        assign_parameter_value(scal_rel_params,params_values,"q_cutoff")
+        assign_parameter_value(scal_rel_params,params_values,"dof")
 
         self.cnc.update_params(cosmo_params,scal_rel_params)
 
