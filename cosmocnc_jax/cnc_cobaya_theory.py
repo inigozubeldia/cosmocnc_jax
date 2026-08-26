@@ -23,6 +23,7 @@ _CNC_PARAM_KEYS = (
     "n_points", "n_obs_select", "n_z", "n_points_data_lik", "sigma_mass_prior",
     "downsample_hmf_bc", "padding_fraction", "pad_abundance", "bc_chunk_size",
     "nd_convolution_mode",
+    "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
     # observables / catalogue
     "load_catalogue", "precompute_cnc_quantities_catalogue", "likelihood_type",
     "obs_select", "observables", "observables_mass_estimation", "cluster_catalogue",
@@ -224,6 +225,9 @@ class cnc(classy):
     # (n_z_error_integral / z_error_* / stacked_data / compute_stacked_cov are
     #  already declared above; not repeated here.)
     pad_abundance: Optional[bool] = False
+    # [direct-conv 2026-08-27] gated final-layer direct-quadrature convolution (default OFF)
+    obs_select_conv_direct: Optional[bool] = False
+    obs_select_conv_chunk: Optional[int] = 128
     bc_chunk_size: Optional[int] = 2000
     nd_convolution_mode: Optional[str] = "linear"
     load_catalogue: Optional[bool] = True
@@ -380,7 +384,8 @@ class cnc(classy):
             self.cnc.cnc_params[_key] = getattr(self, _key)
         # restore int/float types for the shape/size params
         for _key in ("n_points", "n_obs_select", "n_z", "downsample_hmf_bc",
-                     "n_points_data_lik", "bc_chunk_size", "n_z_error_integral"):
+                     "n_points_data_lik", "bc_chunk_size", "n_z_error_integral",
+                     "obs_select_conv_chunk"):
             self.cnc.cnc_params[_key] = int(self.cnc.cnc_params[_key])
         for _key in ("M_min", "M_max"):
             self.cnc.cnc_params[_key] = float(self.cnc.cnc_params[_key])

@@ -626,7 +626,8 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
 
 def build_abundance_kernel(layer_fns, layer_deriv_fns,
                             layer_returns_aux_list, layer_deriv_uses_aux_list,
-                            n_layers, n_points):
+                            n_layers, n_points,
+                            direct_final_conv=False, direct_chunk=128):
     """Factory: build an N-layer abundance kernel for one redshift slice.
 
     Layer functions are captured in the closure (constant across MCMC).
@@ -640,6 +641,25 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
         layer_deriv_uses_aux_list: list of N booleans
         n_layers: int, number of layers (for trace-time loop unrolling)
         n_points: int, grid size (controls array shapes)
+        direct_final_conv: STATIC bool (closure; trace-structure choice)
+            [direct-conv 2026-08-27, GATED default OFF]. When True, the FINAL
+            layer's scatter convolution is evaluated as an explicit quadrature
+            in the layer's INPUT coordinate (the uniform grid of the previous
+            layer — log-spaced for q-type observables):
+                n(q_i) = int dn/dx0(x0) N(q_i - x1(x0); sigma) dx0
+            directly on obs_select_vec — no derivative division, no
+            linear-in-output re-tabulation, no FFT. This keeps a mass power
+            law on its natively-resolved log grid, making the abundance
+            convergent in M_min at fixed n_points by construction (the
+            linear-in-q re-tabulation is what drives the first-order low-M_min
+            artifact; jobs 34159557/34417919). VALIDITY: the final layer's
+            scatter must be genuine and resolved by the observable window
+            (e.g. the unit q noise); sigma is floored at sigma_scatter_min
+            only as a numerical guard.
+        direct_chunk: STATIC int, obs_select_vec chunk size of the lax.scan
+            kernel-matrix contraction (bounds peak memory of the batched
+            (chunk x n_points) Gaussian kernel inside the z/patch vmaps; must
+            divide n_points).
 
     Returns:
         abundance_one_z(hmf_row, ln_M, obs_select_vec,
@@ -654,6 +674,10 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             all_cutoff_vals: tuple of N scalars
             all_apply_cutoffs: tuple of N booleans
     """
+    if direct_final_conv:
+        assert n_points % direct_chunk == 0, (
+            f"direct_chunk={direct_chunk} must divide n_points={n_points}")
+
     def abundance_one_z(hmf_row, ln_M, obs_select_vec,
                         all_layer_args, all_deriv_args,
                         all_scatters, all_cutoff_vals, all_apply_cutoffs,
@@ -679,6 +703,35 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             else:
                 x1 = layer_fn(x0, *layer_args)
                 aux = x0
+
+            # [direct-conv 2026-08-27, GATED] final layer as explicit quadrature
+            # in the INPUT coordinate (see the factory docstring). The Jacobian
+            # is absorbed by integrating in x0 (no derivative division, so the
+            # deriv machinery below is skipped at trace time), the cutoff mask
+            # is applied on x1(x0), and the trapezoid-weighted contraction with
+            # the Gaussian kernel runs in lax.scan chunks over obs_select_vec
+            # so the batched kernel matrix never exceeds (chunk x n_points) per
+            # (z, patch) slice. The result lands exactly ON obs_select_vec, so
+            # the standard final interpolation below reduces to the identity.
+            if direct_final_conv and k == n_layers - 1:
+                integrand = jnp.where(apply_cut_k & (x1 < cutoff_k), 0., dn_dx0)
+                h0 = x0[1] - x0[0]
+                w = jnp.full(x0.shape, h0, dtype=jnp.float64)
+                w = w.at[0].set(0.5 * h0).at[-1].set(0.5 * h0)
+                v = integrand * w
+                sig = jnp.maximum(scatter_k, sigma_scatter_min)
+                inv2s2 = 0.5 / sig**2
+                norm = 1. / (jnp.sqrt(2. * jnp.pi) * sig)
+
+                def _chunk(carry, q_chunk):
+                    K = jnp.exp(-inv2s2 * (q_chunk[:, None] - x1[None, :])**2)
+                    return carry, norm * (K @ v)
+
+                _, out = jax.lax.scan(
+                    _chunk, 0., obs_select_vec.reshape(-1, direct_chunk))
+                x0 = obs_select_vec
+                dn_dx0 = out.reshape(-1)
+                continue
 
             # Derivative
             if layer_deriv_fn is not None:
@@ -1294,7 +1347,10 @@ class cluster_number_counts:
         abundance_kernel_fn = build_abundance_kernel(
             layer_fns_sel, layer_deriv_fns_sel,
             layer_returns_aux_sel, layer_deriv_uses_aux_sel,
-            n_layers_sel, n_points_abund)
+            n_layers_sel, n_points_abund,
+            # [direct-conv 2026-08-27] STATIC gate (trace-structure choice)
+            direct_final_conv=bool(self.cnc_params.get("obs_select_conv_direct", False)),
+            direct_chunk=int(self.cnc_params.get("obs_select_conv_chunk", 128)))
 
         # Build vmap axes for all_layer_args (nested tuple)
         # All layers: prefactors (per-z axis 0) + sr_params (shared None)

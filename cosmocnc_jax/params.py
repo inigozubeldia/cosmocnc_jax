@@ -24,6 +24,15 @@ cnc_params_default = {
     "downsample_hmf_bc": 1,
     "padding_fraction": 0.,
     "pad_abundance": False,
+    # [direct-conv 2026-08-27, GATED default OFF] evaluate the SELECTION
+    # observable's FINAL-layer scatter convolution as an explicit quadrature in
+    # the layer's input (log-spaced) coordinate instead of the linear-in-output
+    # re-tabulation + FFT — makes the abundance convergent in M_min at fixed
+    # n_points (kills the first-order low-M_min grid artifact, jobs
+    # 34159557/34417919). Requires a genuine, resolved final-layer scatter
+    # (e.g. the unit q noise). See build_abundance_kernel in cnc.py.
+    "obs_select_conv_direct": False,
+    "obs_select_conv_chunk": 128,   # lax.scan chunk of the kernel contraction (must divide n_points)
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
 
     # nd_convolution_mode: Convolution mode for N-D (2D+) backward convolution.
