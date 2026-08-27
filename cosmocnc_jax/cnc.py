@@ -2170,12 +2170,20 @@ class cluster_number_counts:
             gamma_jnp = jnp.float64(gamma)
             sigma_mass_prior = jnp.float64(self.cnc_params["sigma_mass_prior"])
 
-            # Cutoff (for selection observable)
+            # Cutoff (for selection observable). [2026-08-28] the survey's own
+            # get_cutoff is now the AUTHORITY (it can derive the threshold from
+            # alternative truncation params, e.g. q_true_cutoff); the raw
+            # "q_cutoff" dict read is only the fallback for surveys without
+            # get_cutoff. For surveys whose get_cutoff returns params["q_cutoff"]
+            # this is value-identical to the previous preference order.
             apply_cutoff_cfg = self.cnc_params["apply_obs_cutoff"]
             if apply_cutoff_cfg != False and apply_cutoff_cfg.get(str([obs_select_key]), False) == True:
                 apply_cutoff = True
-                cutoff_val = jnp.float64(self.scal_rel_params.get("q_cutoff",
-                    sr_sel.get_cutoff(layer=sr_sel.get_n_layers()-1) if hasattr(sr_sel, 'get_cutoff') else 0.0))
+                if hasattr(sr_sel, 'get_cutoff'):
+                    sr_sel.params = self.scal_rel_params  # keep the survey's view fresh
+                    cutoff_val = jnp.float64(sr_sel.get_cutoff(layer=sr_sel.get_n_layers()-1))
+                else:
+                    cutoff_val = jnp.float64(self.scal_rel_params.get("q_cutoff", 0.0))
             else:
                 apply_cutoff = False
                 cutoff_val = jnp.float64(-jnp.inf)
