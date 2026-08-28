@@ -135,7 +135,13 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
     def backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
                           cov_layer0, cov_layer1, n_points,
-                          apply_cutoff, cutoff_val):
+                          apply_cutoff, cutoff_val,
+                          mean_cut_val=-jnp.inf):
+        # [q_mean_cutoff 2026-08-28] mean_cut_val = pre-intrinsic-scatter
+        # truncation threshold in the SELECTION observable's layer-0 OUTPUT
+        # space (ln q-bar); the mass-grid mask x_l0_list[0] < mean_cut_val is
+        # applied to the final mass-space cpdf in every path. Default -inf =
+        # never fires = bit-identical legacy behaviour.
 
         # ── Forward pass: layer 0 on lnM grid ──
         x_l0_list = []
@@ -185,6 +191,13 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
             # Interpolate back to original (SR-distorted) grid
             cpdf = interp_uniform(x_l0_list[0], x_l0_list[0][0], x_l0_list[0][-1],
                                    n_points, cpdf)
+            # [q_mean_cutoff] pre-scatter mass-floor mask (ln q-bar space).
+            # [anti-aliased 2026-08-28] fractional-cell edge weight instead of a
+            # binary step: second-order accurate, continuous in parameters (no
+            # grid-phase sawtooth for a SAMPLED cutoff). Exactly 1 when unset
+            # (mean_cut_val = -inf -> clip(+inf) = 1 -> cpdf * 1.0 bit-identical).
+            _dxs = jnp.maximum(jnp.abs(jnp.gradient(x_l0_list[0])), 1e-30)
+            cpdf = cpdf * jnp.clip((x_l0_list[0] - mean_cut_val) / _dxs + 0.5, 0., 1.)
         elif n_obs == 2:
             # ── Optimized 2D path ──
             # Use meshgrid + eval_gaussian_nd (XLA-friendly kernel fusion)
@@ -231,6 +244,13 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
                     cpdf[i0, i1 + 1] * (1 - t0) * t1 +
                     cpdf[i0 + 1, i1] * t0 * (1 - t1) +
                     cpdf[i0 + 1, i1 + 1] * t0 * t1)
+            # [q_mean_cutoff] pre-scatter mass-floor mask (ln q-bar space).
+            # [anti-aliased 2026-08-28] fractional-cell edge weight instead of a
+            # binary step: second-order accurate, continuous in parameters (no
+            # grid-phase sawtooth for a SAMPLED cutoff). Exactly 1 when unset
+            # (mean_cut_val = -inf -> clip(+inf) = 1 -> cpdf * 1.0 bit-identical).
+            _dxs = jnp.maximum(jnp.abs(jnp.gradient(x_l0_list[0])), 1e-30)
+            cpdf = cpdf * jnp.clip((x_l0_list[0] - mean_cut_val) / _dxs + 0.5, 0., 1.)
         else:
             # ── General N-D path (3+ observables) ──
             x1_stack = jnp.stack(x_l1_residuals)
@@ -259,6 +279,13 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
             interp = RegularGridInterpolator(linear_grids, cpdf,
                                               fill_value=0., bounds_error=False)
             cpdf = interp(diag_points)
+            # [q_mean_cutoff] pre-scatter mass-floor mask (ln q-bar space).
+            # [anti-aliased 2026-08-28] fractional-cell edge weight instead of a
+            # binary step: second-order accurate, continuous in parameters (no
+            # grid-phase sawtooth for a SAMPLED cutoff). Exactly 1 when unset
+            # (mean_cut_val = -inf -> clip(+inf) = 1 -> cpdf * 1.0 bit-identical).
+            _dxs = jnp.maximum(jnp.abs(jnp.gradient(x_l0_list[0])), 1e-30)
+            cpdf = cpdf * jnp.clip((x_l0_list[0] - mean_cut_val) / _dxs + 0.5, 0., 1.)
 
         return cpdf
 
@@ -354,7 +381,7 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
     def per_cluster(r0, r1, kc0, kc1, x_l0_0, x_l0_1,
                     x_lin_0_start, x_lin_1_start, dx0, dx1,
                     obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
-                    has_scatter, apply_cutoff, cutoff_val):
+                    has_scatter, apply_cutoff, cutoff_val, mean_cut_val):
         # Layer-1 Gaussian (outer product — no meshgrid)
         maha1 = (inv_cov1[0, 0] * r0[:, None]**2 +
                  inv_cov1[1, 1] * r1[None, :]**2 +
@@ -387,6 +414,13 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
                 cpdf[i0 + 1, i1] * t0 * (1 - t1) +
                 cpdf[i0 + 1, i1 + 1] * t0 * t1)
 
+        # [q_mean_cutoff 2026-08-28] pre-scatter mass-floor mask: x_l0_0 is the
+        # selection observable's layer-0 forward output (ln q-bar) at each mass
+        # point of the diagonal. [anti-aliased 2026-08-28] fractional-cell edge
+        # weight (see backward_conv_nd); exactly 1 when unset (-inf).
+        _dxs = jnp.maximum(jnp.abs(jnp.gradient(x_l0_0)), 1e-30)
+        cpdf = cpdf * jnp.clip((x_l0_0 - mean_cut_val) / _dxs + 0.5, 0., 1.)
+
         return cpdf
 
     vmap_in = (
@@ -396,7 +430,7 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
         0, 0,               # inv_cov1, norm1 (per-cluster)
         0, 0,               # inv_cov0, norm0 (per-cluster)
         0,                  # has_scatter (per-cluster)
-        None, None,         # apply_cutoff, cutoff_val
+        None, None, None,   # apply_cutoff, cutoff_val, mean_cut_val
     )
 
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
@@ -437,7 +471,7 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
     def per_cluster(mn, mx, obs_vals, E_z, D_A, D_l_CMB, rho_c,
                     H0, D_CMB, gamma, z_c,
                     all_pref_sr, all_layer0_sr, all_layer1_sr,
-                    cov_l0, cov_l1, apply_cut, cut_val,
+                    cov_l0, cov_l1, apply_cut, cut_val, mean_cut_val,
                     patch_idx):
         lnM = jnp.linspace(mn, mx, n_pts)
         layer0_args = []
@@ -451,7 +485,7 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
             layer0_args.append(prefs + l0_k)
             layer1_args.append(prefs + l1_k)
         return bc_fn(lnM, obs_vals, tuple(layer0_args), tuple(layer1_args),
-                     cov_l0, cov_l1, n_pts, apply_cut, cut_val)
+                     cov_l0, cov_l1, n_pts, apply_cut, cut_val, mean_cut_val)
 
     vmap_in = (
         0, 0, 0,                                         # mn, mx, obs_vals
@@ -461,7 +495,7 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
         tuple([None]*n_sub),                              # all_layer0_sr (n_patches, ...)
         tuple([None]*n_sub),                              # all_layer1_sr (n_patches, ...)
         0, 0,                                             # cov_l0, cov_l1 (per-cluster)
-        None, None,                                       # apply_cut, cut_val
+        None, None, None,                                 # apply_cut, cut_val, mean_cut_val
         0,                                                # patch_idx (per-cluster)
     )
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
@@ -745,8 +779,19 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             safe_d = jnp.where(dx1_dx0 == 0, 1.0, dx1_dx0)
             dn_dx1 = jnp.where((dx1_dx0 == 0) | jnp.isnan(dx1_dx0), 0.0, dn_dx0 / safe_d)
 
-            # Apply cutoff before interpolation
-            dn_dx1 = jnp.where(apply_cut_k & (x1 < cutoff_k), 0., dn_dx1)
+            # Apply cutoff before interpolation.
+            # [anti-aliased 2026-08-28] LAYER 0 ONLY (the pre-scatter
+            # q_mean_cutoff, a hard step in mass): fractional-cell edge weight —
+            # second-order accurate and continuous in a SAMPLED cutoff (no
+            # grid-phase sawtooth). apply_cut_k False (or cutoff -inf) -> the
+            # weight is exactly 1 -> unchanged. Layers >= 1 keep the exact
+            # legacy binary mask (certified behaviour, byte-identical).
+            if k == 0:
+                _d0 = jnp.maximum(jnp.abs(jnp.gradient(x1)), 1e-30)
+                _w0 = jnp.clip((x1 - cutoff_k) / _d0 + 0.5, 0., 1.)
+                dn_dx1 = jnp.where(apply_cut_k, dn_dx1 * _w0, dn_dx1)
+            else:
+                dn_dx1 = jnp.where(apply_cut_k & (x1 < cutoff_k), 0., dn_dx1)
 
             # Pad + interpolate to fixed-size grid
             pad = jnp.where(pad_abundance & (scatter_k > sigma_scatter_min),
@@ -1139,7 +1184,7 @@ class cluster_number_counts:
                             all_pref_sr, all_layer0_sr, all_layer1_sr,
                             all_layer0_sr_pc, all_layer1_sr_pc,
                             all_cov_layer0, all_cov_layer1,
-                            all_apply_cut, all_cut_val,
+                            all_apply_cut, all_cut_val, all_mean_cut_val,
                             lnM0_min, lnM0_max, n_lnM0,
                             patch_idx,
                             obs_vals_1layer, has_obs_1layer,
@@ -1189,7 +1234,8 @@ class cluster_number_counts:
                             lnM, set_obs_arr,
                             tuple(set_layer0_args), tuple(set_layer1_args),
                             all_cov_layer0[s], all_cov_layer1[s],
-                            n_pts, all_apply_cut[s], all_cut_val[s])
+                            n_pts, all_apply_cut[s], all_cut_val[s],
+                            all_mean_cut_val[s])
 
                     cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
 
@@ -1236,6 +1282,7 @@ class cluster_number_counts:
                 tuple([0]*n_s),     # all_cov_layer1 (n_bc, n_obs, n_obs) per-set
                 tuple([None]*n_s),  # all_apply_cut (per-set)
                 tuple([None]*n_s),  # all_cut_val (per-set)
+                tuple([None]*n_s),  # all_mean_cut_val (per-set) [q_mean_cutoff 2026-08-28]
                 None, None, None,   # lnM0_min, lnM0_max, n_lnM0
                 0,                  # patch_idx (per-cluster)
                 # 1-layer observables (obs_vals/has always (max(n_1layer,1), n_bc), axis 1)
@@ -2182,11 +2229,16 @@ class cluster_number_counts:
                 if hasattr(sr_sel, 'get_cutoff'):
                     sr_sel.params = self.scal_rel_params  # keep the survey's view fresh
                     cutoff_val = jnp.float64(sr_sel.get_cutoff(layer=sr_sel.get_n_layers()-1))
+                    # [q_mean_cutoff 2026-08-28] pre-scatter mass-floor threshold
+                    # (survey's layer-0 cutoff, ln q-bar space; -inf when unset)
+                    mean_cutoff_val = jnp.float64(sr_sel.get_cutoff(layer=0))
                 else:
                     cutoff_val = jnp.float64(self.scal_rel_params.get("q_cutoff", 0.0))
+                    mean_cutoff_val = jnp.float64(-jnp.inf)
             else:
                 apply_cutoff = False
                 cutoff_val = jnp.float64(-jnp.inf)
+                mean_cutoff_val = jnp.float64(-jnp.inf)
 
             # Downsampled HMF grid
             hmf_matrix_ds = self.hmf_matrix[:,::self.cnc_params["downsample_hmf_bc"]]
@@ -2291,6 +2343,7 @@ class cluster_number_counts:
             all_cov_layer1 = []
             all_apply_cut_sets = []
             all_cut_val_sets = []
+            all_meancut_val_sets = []   # [q_mean_cutoff 2026-08-28]
             # Per-cluster z passed through the standard NumPy idiom
             # other_params['zc'] — vectorised: scatter classes that depend on
             # z (e.g. Planck shear via Magneticum) consume this as an (n_bc,)
@@ -2319,11 +2372,16 @@ class cluster_number_counts:
                 all_apply_cut_sets.append(apply_cutoff and set_has_cutoff)
                 all_cut_val_sets.append(
                     cutoff_val if set_has_cutoff else jnp.float64(-jnp.inf))
+                # [q_mean_cutoff 2026-08-28] pre-scatter mass-floor threshold
+                # (ln q-bar space), same per-set gating as the layer-1 cutoff
+                all_meancut_val_sets.append(
+                    mean_cutoff_val if set_has_cutoff else jnp.float64(-jnp.inf))
 
             all_cov_layer0 = tuple(all_cov_layer0)
             all_cov_layer1 = tuple(all_cov_layer1)
             all_apply_cut_sets = tuple(all_apply_cut_sets)
             all_cut_val_sets = tuple(all_cut_val_sets)
+            all_meancut_val_sets = tuple(all_meancut_val_sets)
 
             bc_chunk = int(self.cnc_params.get("bc_chunk_size", 0))
             n_points_dl = int(self.cnc_params["n_points_data_lik"])
@@ -2332,6 +2390,7 @@ class cluster_number_counts:
             shared_args = (all_pref_sr, all_layer0_sr, all_layer1_sr,
                            all_cov_layer0, all_cov_layer1,
                            all_apply_cut_sets, all_cut_val_sets,
+                           all_meancut_val_sets,   # [q_mean_cutoff 2026-08-28]
                            lnM0_min, lnM0_max, n_lnM0)
             # Per-cluster args (vmapped on axis 0)
             pc_args = (all_layer0_sr_pc, all_layer1_sr_pc)
@@ -2370,7 +2429,7 @@ class cluster_number_counts:
                                    sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                    sub_l0_pc, sub_l1_pc,
                                    sub_cov_l0, sub_cov_l1,
-                                   sub_apply_cut, sub_cut_val,
+                                   sub_apply_cut, sub_cut_val, sub_mean_cut_val,
                                    patch_sub):
                 """Run 2D split-JIT (forward + conv) for a cluster group.
 
@@ -2413,7 +2472,7 @@ class cluster_number_counts:
                     r0, r1, kc0, kc1, x_l0_0, x_l0_1,
                     x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
                     obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
-                    has_scatter, sub_apply_cut, sub_cut_val)
+                    has_scatter, sub_apply_cut, sub_cut_val, sub_mean_cut_val)
 
             def _compute_all_set_cpdfs(sl=None):
                 """Compute pre_nd_cpdfs for all sets with pattern-aware dispatch.
@@ -2490,6 +2549,9 @@ class cluster_number_counts:
                         sub_apply_cut = (apply_cutoff and sel_at_0)
                         sub_cut_val = (cutoff_val if sel_at_0
                                        else jnp.float64(-jnp.inf))
+                        # [q_mean_cutoff 2026-08-28] same gating as sub_cut_val
+                        sub_mean_cut = (mean_cutoff_val if sel_at_0
+                                        else jnp.float64(-jnp.inf))
 
                         jit_info = self._sub_bc_jits.get((s_idx, pattern))
                         if jit_info is None:
@@ -2513,7 +2575,7 @@ class cluster_number_counts:
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_l0_pc, sub_l1_pc,
                                 sub_cov_l0, sub_cov_l1,
-                                sub_apply_cut, sub_cut_val,
+                                sub_apply_cut, sub_cut_val, sub_mean_cut,
                                 patch_sub)
                         elif jit_info['type'] == 'generic':
                             set_obs = jnp.stack(
@@ -2525,7 +2587,7 @@ class cluster_number_counts:
                                 H0_jnp, D_CMB_jnp, gamma_jnp, zc,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_cov_l0, sub_cov_l1,
-                                sub_apply_cut, sub_cut_val,
+                                sub_apply_cut, sub_cut_val, sub_mean_cut,
                                 patch_sub)
                         else:
                             continue
