@@ -24,6 +24,7 @@ _CNC_PARAM_KEYS = (
     "downsample_hmf_bc", "padding_fraction", "pad_abundance", "bc_chunk_size",
     "nd_convolution_mode",
     "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
+    "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
     # observables / catalogue
     "load_catalogue", "precompute_cnc_quantities_catalogue", "likelihood_type",
     "obs_select", "observables", "observables_mass_estimation", "cluster_catalogue",
@@ -91,6 +92,7 @@ _SR_INPUT_PARAMS = (
     "alpha2_szifi",  # [2026-08-18] running of the SZ mass exponent (curv model)
     "beta2_szifi",   # [2026-08-18] running of the SZ E(z) exponent (curv model)
     "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq (sigz model)
+    "sigma_lnq_m_szifi", # [2026-08-29] mass-running of sigma_lnq (mass-dep scatter model)
     "dalpha_szifi",  # [2026-08-19] faint-end slope offset (two-slope model)
     "q_cutoff",      # [2026-08-27] selection cutoff as a sampled nuisance; when not
                      # sampled, calculate() falls back to the cnc_params mirror
@@ -237,6 +239,8 @@ class cnc(classy):
     # [direct-conv 2026-08-27] gated final-layer direct-quadrature convolution (default OFF)
     obs_select_conv_direct: Optional[bool] = False
     obs_select_conv_chunk: Optional[int] = 128
+    # [mass-dep scatter 2026-08-29] gated layer-0 sigma(M, z) via explicit quadrature (default OFF)
+    mass_dep_scatter: Optional[bool] = False
     bc_chunk_size: Optional[int] = 2000
     nd_convolution_mode: Optional[str] = "linear"
     load_catalogue: Optional[bool] = True
@@ -490,6 +494,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"alpha2_szifi")   # [2026-08-18]
         assign_parameter_value(scal_rel_params,params_values,"beta2_szifi")    # [2026-08-18]
         assign_parameter_value(scal_rel_params,params_values,"gamma_z_szifi")  # [2026-08-18]
+        assign_parameter_value(scal_rel_params,params_values,"sigma_lnq_m_szifi")  # [2026-08-29]
         assign_parameter_value(scal_rel_params,params_values,"dalpha_szifi")   # [2026-08-19]
 
         # DES Y3 WL — 10-parameter Magneticum B13 calibration (joint Gaussian

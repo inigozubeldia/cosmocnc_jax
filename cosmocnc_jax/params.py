@@ -33,6 +33,11 @@ cnc_params_default = {
     # (e.g. the unit q noise). See build_abundance_kernel in cnc.py.
     "obs_select_conv_direct": False,
     "obs_select_conv_chunk": 128,   # lax.scan chunk of the kernel contraction (must divide n_points)
+    # [mass-dep scatter 2026-08-29, GATED default OFF] layer-0 intrinsic scatter as an
+    # arbitrary sigma(M, z) (survey scatter class get_std_x), evaluated by explicit
+    # quadrature at the abundance layer 0 and the 1D backward conv. Guards: selection
+    # observable must be 2-layer and sit in a 1-observable correlation set.
+    "mass_dep_scatter": False,
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
 
     # nd_convolution_mode: Convolution mode for N-D (2D+) backward convolution.

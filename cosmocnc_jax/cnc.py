@@ -108,7 +108,7 @@ def _bilinear_interp_2d(xi0, xi1, grid, x0_start, dx0, n0, x1_start, dx1, n1):
 
 
 def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs,
-                           nd_circular=True):
+                           nd_circular=True, xdep_scatter_layer0=False):
     """Factory: build an N-dimensional backward conv for a correlation set.
 
     Handles N correlated observables with full covariance structure across layers.
@@ -119,6 +119,19 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
         layer1_fns: list of N pure JAX layer-1 functions
         layer0_returns_aux_list: list of N booleans
         n_obs: number of observables in the correlation set
+        xdep_scatter_layer0: STATIC bool [mass-dep scatter 2026-08-29, GATED
+            default OFF; n_obs == 1 ONLY]. When True, the layer-0 intrinsic
+            scatter is a PER-MASS-POINT width sigma(lnM, z): the stationary
+            [FFT convolution + interp] pair is replaced by one explicit
+            row-quadrature, each output mass point i integrating the layer-1
+            backward pdf against N(x_l0(lnM_i) - x; sigma_i), normalised by
+            the FULL-WINDOW kernel sum S(sigma_i) (the stationary path's
+            sum(kernel)) so constant sigma reproduces the certified
+            zero-padded convention. sigma_i is interpolated inside the kernel
+            from the (lnM_ref, sigma_x_row) table passed per cluster. NOTE:
+            the per-cluster mass-range estimation keeps the scalar get_cov
+            sigma for its grid bounds — a window-sizing approximation when
+            sigma varies strongly across the grid (both twins share it).
 
     Returns:
         backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
@@ -133,10 +146,14 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
         cov_layer1: (n_obs, n_obs) covariance matrix for layer 1
     """
 
+    if xdep_scatter_layer0:
+        assert n_obs == 1, "xdep_scatter_layer0 supports only 1-observable sets"
+
     def backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
                           cov_layer0, cov_layer1, n_points,
                           apply_cutoff, cutoff_val,
-                          mean_cut_val=-jnp.inf):
+                          mean_cut_val=-jnp.inf,
+                          sigma_x_row=None, lnM_ref=None):
         # [q_mean_cutoff 2026-08-28] mean_cut_val = pre-intrinsic-scatter
         # truncation threshold in the SELECTION observable's layer-0 OUTPUT
         # space (ln q-bar); the mass-grid mask x_l0_list[0] < mean_cut_val is
@@ -178,19 +195,48 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
             # Layer-0 convolution
             x_lin = x_l0_linear_list[0]
-            dx = x_lin[1] - x_lin[0]
-            x_kernel = x_lin - jnp.mean(x_lin) + 0.5 * dx
+            if xdep_scatter_layer0:
+                # [mass-dep scatter 2026-08-29, GATED] per-mass-point width:
+                # row i (output mass point lnM_i, layer-0 mean x_l0_i)
+                # integrates the layer-1 backward pdf against
+                # N(x_l0_i - x; sigma(lnM_i)) — one contraction replaces
+                # [FFT conv + interp]; normalisation below.
+                sig_i = jnp.maximum(jnp.interp(lnM, lnM_ref, sigma_x_row), 1e-30)
+                target = x_l0_list[0]
+                K = jnp.exp(-0.5 * ((target[:, None] - x_lin[None, :])
+                                    / sig_i[:, None])**2)
+                # normalise each row by the FULL-WINDOW kernel sum S(sigma_i)
+                # (the stationary path's sum(kernel), centred mid-grid) — NOT
+                # the row sum: row-sum renormalisation inflates edge-truncated
+                # windows, a sigma-dependent (hence parameter-dependent)
+                # departure from the certified zero-padded convention (caught
+                # by the tilt-stability check, test 34579952).
+                dxl = x_lin[1] - x_lin[0]
+                x_kern = x_lin - jnp.mean(x_lin) + 0.5 * dxl
+                S_i = jnp.maximum(jnp.sum(
+                    jnp.exp(-0.5 * (x_kern[None, :] / sig_i[:, None])**2),
+                    axis=1), 1e-300)
+                cpdf_q = (K @ cpdf) / S_i
+                # tiny-sigma fallback (mirrors the stationary path's
+                # cov <= 1e-20 no-scatter branch): plain interpolation
+                cpdf_i = interp_uniform(target, target[0], target[-1],
+                                        n_points, cpdf)
+                cpdf = jnp.where(sig_i > 1e-10, cpdf_q, cpdf_i)
+                cpdf = jnp.maximum(cpdf, 0.)
+            else:
+                dx = x_lin[1] - x_lin[0]
+                x_kernel = x_lin - jnp.mean(x_lin) + 0.5 * dx
 
-            cov_l0_scalar = cov_layer0[0, 0]
-            kernel = gaussian_1d(x_kernel, jnp.maximum(jnp.sqrt(cov_l0_scalar), 1e-30))
-            cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
-            cpdf = jnp.where(cov_l0_scalar > 1e-20, cpdf_conv, cpdf)
+                cov_l0_scalar = cov_layer0[0, 0]
+                kernel = gaussian_1d(x_kernel, jnp.maximum(jnp.sqrt(cov_l0_scalar), 1e-30))
+                cpdf_conv = convolve_nd(cpdf, kernel, circular=nd_circular)
+                cpdf = jnp.where(cov_l0_scalar > 1e-20, cpdf_conv, cpdf)
 
-            cpdf = jnp.maximum(cpdf, 0.)
+                cpdf = jnp.maximum(cpdf, 0.)
 
-            # Interpolate back to original (SR-distorted) grid
-            cpdf = interp_uniform(x_l0_list[0], x_l0_list[0][0], x_l0_list[0][-1],
-                                   n_points, cpdf)
+                # Interpolate back to original (SR-distorted) grid
+                cpdf = interp_uniform(x_l0_list[0], x_l0_list[0][0], x_l0_list[0][-1],
+                                       n_points, cpdf)
             # [q_mean_cutoff] pre-scatter mass-floor mask (ln q-bar space).
             # [anti-aliased 2026-08-28] fractional-cell edge weight instead of a
             # binary step: second-order accurate, continuous in parameters (no
@@ -661,7 +707,8 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
 def build_abundance_kernel(layer_fns, layer_deriv_fns,
                             layer_returns_aux_list, layer_deriv_uses_aux_list,
                             n_layers, n_points,
-                            direct_final_conv=False, direct_chunk=128):
+                            direct_final_conv=False, direct_chunk=128,
+                            xdep_scatter_layer0=False):
     """Factory: build an N-layer abundance kernel for one redshift slice.
 
     Layer functions are captured in the closure (constant across MCMC).
@@ -694,12 +741,27 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             kernel-matrix contraction (bounds peak memory of the batched
             (chunk x n_points) Gaussian kernel inside the z/patch vmaps; must
             divide n_points).
+        xdep_scatter_layer0: STATIC bool (closure; trace-structure choice)
+            [mass-dep scatter 2026-08-29, GATED default OFF]. When True, the
+            LAYER-0 scatter convolution is evaluated as an explicit quadrature
+            in the layer's INPUT coordinate (the native log-M grid), with a
+            PER-MASS-POINT kernel width sigma_j = sigma_x_l0[j]:
+                dn/dy(y_i) = int dx0 dn/dx0(x0) N(y_i - x1(x0); sigma(x0))
+            i.e. the intrinsic scatter may be ANY function of mass (and, via
+            the per-z evaluation of sigma_x_l0, redshift). The Jacobian is
+            absorbed by integrating in x0; the layer-0 anti-aliased cutoff
+            weight is applied pointwise on the integrand; the output lands on
+            the same padded uniform grid the FFT path would use (pad from
+            max(sigma)). False (default) = the FFT path, byte-identical to the
+            pre-2026-08-29 code. VALIDITY: sigma must be genuine scatter
+            resolved by the grid (floored at sigma_scatter_min as a guard).
+            Uses direct_chunk for the lax.scan chunking.
 
     Returns:
         abundance_one_z(hmf_row, ln_M, obs_select_vec,
                         all_layer_args, all_deriv_args,
                         all_scatters, all_cutoff_vals, all_apply_cutoffs,
-                        sigma_scatter_min, skyfrac, pad_abundance)
+                        sigma_scatter_min, skyfrac, pad_abundance, sigma_x_l0)
         where:
             all_layer_args: tuple of N tuples (layer k args = prefactors + sr_params)
             all_deriv_args: tuple of N tuples
@@ -707,15 +769,18 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                 enclosing vmaps; [z-dep selection scatter 2026-08-18])
             all_cutoff_vals: tuple of N scalars
             all_apply_cutoffs: tuple of N booleans
+            sigma_x_l0: (n_x,) per-mass-point layer-0 sigma (per (patch, z)
+                after the two enclosing vmaps); a length-1 dummy when
+                xdep_scatter_layer0 is False (ignored at trace time).
     """
-    if direct_final_conv:
+    if direct_final_conv or xdep_scatter_layer0:
         assert n_points % direct_chunk == 0, (
             f"direct_chunk={direct_chunk} must divide n_points={n_points}")
 
     def abundance_one_z(hmf_row, ln_M, obs_select_vec,
                         all_layer_args, all_deriv_args,
                         all_scatters, all_cutoff_vals, all_apply_cutoffs,
-                        sigma_scatter_min, skyfrac, pad_abundance):
+                        sigma_scatter_min, skyfrac, pad_abundance, sigma_x_l0):
         x0 = ln_M
         dn_dx0 = hmf_row
 
@@ -764,6 +829,42 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                 _, out = jax.lax.scan(
                     _chunk, 0., obs_select_vec.reshape(-1, direct_chunk))
                 x0 = obs_select_vec
+                dn_dx0 = out.reshape(-1)
+                continue
+
+            # [mass-dep scatter 2026-08-29, GATED] layer 0 as explicit
+            # quadrature in the INPUT (log-M) coordinate with a PER-MASS-POINT
+            # kernel width sigma_x_l0 (any sigma(M, z); see factory docstring).
+            # Integrates in x0 (Jacobian absorbed — the deriv machinery below
+            # is skipped at trace time); the layer-0 anti-aliased cutoff weight
+            # is applied pointwise on the integrand; the output lands on the
+            # same padded uniform grid the FFT path would build, so all later
+            # layers proceed unchanged.
+            if xdep_scatter_layer0 and k == 0:
+                _d0 = jnp.maximum(jnp.abs(jnp.gradient(x1)), 1e-30)
+                _w0 = jnp.clip((x1 - cutoff_k) / _d0 + 0.5, 0., 1.)
+                integrand = jnp.where(apply_cut_k, dn_dx0 * _w0, dn_dx0)
+                h0 = x0[1] - x0[0]
+                w = jnp.full(x0.shape, h0, dtype=jnp.float64)
+                w = w.at[0].set(0.5 * h0).at[-1].set(0.5 * h0)
+                sig = jnp.maximum(sigma_x_l0, sigma_scatter_min)
+                # per-SOURCE normalisation: each mass point spreads its number
+                # density with its own sigma_j (int N dy = 1 per source)
+                v = integrand * w / (jnp.sqrt(2. * jnp.pi) * sig)
+                inv2s2 = 0.5 / sig**2
+                pad = jnp.where(pad_abundance & (jnp.max(sig) > sigma_scatter_min),
+                                8. * jnp.max(sig), 0.)
+                y_min = jnp.min(x1) - pad
+                y_max = jnp.max(x1) + pad
+                y_grid = jnp.linspace(y_min, y_max, n_points)
+
+                def _chunk_l0(carry, y_chunk):
+                    K = jnp.exp(-inv2s2[None, :] * (y_chunk[:, None] - x1[None, :])**2)
+                    return carry, K @ v
+
+                _, out = jax.lax.scan(
+                    _chunk_l0, 0., y_grid.reshape(-1, direct_chunk))
+                x0 = y_grid
                 dn_dx0 = out.reshape(-1)
                 continue
 
@@ -962,6 +1063,41 @@ class cluster_number_counts:
         use_analytical = (self.cnc_params.get("scalrel_type_deriv", "analytical") == "analytical")
         self._use_analytical_deriv = use_analytical
 
+        # [mass-dep scatter 2026-08-29] GATE resolution + fail-fast guards.
+        # When ON, the SELECTION observable's LAYER-0 intrinsic scatter may be
+        # any function sigma(M, z), supplied by the survey scatter class via
+        # get_std_x. Supported paths: abundance layer 0 (explicit quadrature)
+        # and the 1D backward conv. Everything else is guarded off loudly.
+        self._xdep_scatter_on = bool(self.cnc_params.get("mass_dep_scatter", False))
+        if self._xdep_scatter_on:
+            if not hasattr(self.scatter, "get_std_x"):
+                raise NotImplementedError(
+                    "mass_dep_scatter=True but the survey scatter class has no "
+                    "get_std_x(observable1, observable2, layer, lnM, other_params)")
+            if not (hasattr(self.scatter, "x_dep_scatter")
+                    and self.scatter.x_dep_scatter(obs_select_name, obs_select_name, 0)):
+                raise NotImplementedError(
+                    "mass_dep_scatter=True but the survey scatter class does not "
+                    f"declare x-dependent scatter for ({obs_select_name}, layer 0)")
+            if sr_sel.get_n_layers() != 2:
+                raise NotImplementedError(
+                    "mass_dep_scatter supports only 2-layer selection observables "
+                    f"(got {sr_sel.get_n_layers()})")
+            for _oset in self.cnc_params["observables"]:
+                if obs_select_name in _oset and len(_oset) != 1:
+                    raise NotImplementedError(
+                        "mass_dep_scatter=True: the selection observable must be in "
+                        "a 1-observable correlation set (the >=2D backward conv does "
+                        f"not support x-dependent scatter); got set {_oset}")
+            if self.cnc_params.get("stacked_likelihood", False):
+                for _key in self.cnc_params.get("stacked_data", []):
+                    if (self.catalogue.stacked_data[_key]["observable"]
+                            == obs_select_name):
+                        raise NotImplementedError(
+                            "mass_dep_scatter=True: the stacked-likelihood path "
+                            "does not support x-dependent scatter for the "
+                            "selection observable")
+
         # ── 1. Backward conv functions per correlation set ──
         # _bc_set_fns: list of (bc_fn, obs_names_in_set) per correlation set
         # _bc_obs_list: flat list of all backward-conv observable names (for data gathering)
@@ -1007,7 +1143,11 @@ class cluster_number_counts:
             nd_circular = self.cnc_params.get("nd_convolution_mode", "linear") == "circular"
             bc_set_fn = build_backward_conv_nd(
                 layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set,
-                nd_circular=nd_circular)
+                nd_circular=nd_circular,
+                # [mass-dep scatter 2026-08-29] only the selection observable's
+                # own 1-obs set gets the x-dep layer-0 kernel (guards above)
+                xdep_scatter_layer0=(self._xdep_scatter_on
+                                     and bc_obs_in_set == [obs_select_name]))
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
 
@@ -1190,7 +1330,8 @@ class cluster_number_counts:
                             obs_vals_1layer, has_obs_1layer,
                             all_pref_sr_1layer, all_layer0_sr_1layer,
                             all_layer0_sr_pc_1layer, all_cov_1layer,
-                            pre_nd_cpdfs):
+                            pre_nd_cpdfs,
+                            all_sigma_x, lnM_ref_sx):
                 # Shared: lnM grid and HMF interp (computed once)
                 lnM = jnp.linspace(mn, mx, n_pts)
                 hmf = interp_uniform(lnM, lnM0_min, lnM0_max, n_lnM0, hz,
@@ -1235,7 +1376,10 @@ class cluster_number_counts:
                             tuple(set_layer0_args), tuple(set_layer1_args),
                             all_cov_layer0[s], all_cov_layer1[s],
                             n_pts, all_apply_cut[s], all_cut_val[s],
-                            all_mean_cut_val[s])
+                            all_mean_cut_val[s],
+                            # [mass-dep scatter 2026-08-29] ignored at trace
+                            # time by sets built without the x-dep flag
+                            sigma_x_row=all_sigma_x[s], lnM_ref=lnM_ref_sx)
 
                     cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
 
@@ -1293,6 +1437,8 @@ class cluster_number_counts:
                 tuple([None]*n_1layer) if n_1layer > 0 else (),
                 # end 1-layer
                 tuple([0]*n_s),     # pre_nd_cpdfs: all vmapped on axis 0
+                tuple([0]*n_s),     # all_sigma_x (n_bc, n_ref) per set [mass-dep scatter 2026-08-29]
+                None,               # lnM_ref_sx (n_ref,) shared
             )
             return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in)), per_cluster
 
@@ -1397,7 +1543,9 @@ class cluster_number_counts:
             n_layers_sel, n_points_abund,
             # [direct-conv 2026-08-27] STATIC gate (trace-structure choice)
             direct_final_conv=bool(self.cnc_params.get("obs_select_conv_direct", False)),
-            direct_chunk=int(self.cnc_params.get("obs_select_conv_chunk", 128)))
+            direct_chunk=int(self.cnc_params.get("obs_select_conv_chunk", 128)),
+            # [mass-dep scatter 2026-08-29] STATIC gate (trace-structure choice)
+            xdep_scatter_layer0=self._xdep_scatter_on)
 
         # Build vmap axes for all_layer_args (nested tuple)
         # All layers: prefactors (per-z axis 0) + sr_params (shared None)
@@ -1429,6 +1577,7 @@ class cluster_number_counts:
             tuple([None]*n_layers_sel), # all_cutoff_vals
             tuple([None]*n_layers_sel), # all_apply_cutoffs
             None, None, None,           # sigma_scatter_min, skyfrac, pad_abundance
+            0,                          # sigma_x_l0 (per-z axis) [mass-dep scatter 2026-08-29]
         )
         abundance_vmap_z = jax.vmap(abundance_kernel_fn, in_axes=z_vmap_in_axes)
 
@@ -1460,6 +1609,7 @@ class cluster_number_counts:
             tuple([None]*n_layers_sel),  # all_cutoff_vals
             tuple([None]*n_layers_sel),  # all_apply_cutoffs
             None, 0, None,              # sigma_scatter_min, skyfrac, pad_abundance
+            0,                          # sigma_x_l0 (per-patch axis) [mass-dep scatter 2026-08-29]
         )
         abundance_vmap_pz = jax.vmap(abundance_vmap_z, in_axes=p_vmap_in_axes)
 
@@ -1469,12 +1619,13 @@ class cluster_number_counts:
             def compute(hmf_matrix, ln_M, obs_select_vec, redshift_vec,
                         all_layer_args, all_deriv_args,
                         all_scatters, all_cutoff_vals, all_apply_cutoffs,
-                        sigma_scatter_min, skyfracs, pad_abundance, total_skyfrac):
+                        sigma_scatter_min, skyfracs, pad_abundance, total_skyfrac,
+                        sigma_x_l0):
                 abundance_tensor = vmap_pz(
                     hmf_matrix, ln_M, obs_select_vec,
                     all_layer_args, all_deriv_args,
                     all_scatters, all_cutoff_vals, all_apply_cutoffs,
-                    sigma_scatter_min, skyfracs, pad_abundance)
+                    sigma_scatter_min, skyfracs, pad_abundance, sigma_x_l0)
                 n_obs_matrix = simpson(abundance_tensor, x=redshift_vec, axis=1)
                 n_tot_vec = simpson(n_obs_matrix, x=obs_select_vec, axis=-1)
                 abundance_matrix = jnp.sum(abundance_tensor, axis=0)
@@ -1950,13 +2101,34 @@ class cluster_number_counts:
         pad_abundance = jnp.bool_(self.cnc_params.get("pad_abundance", False))
         total_skyfrac = jnp.sum(skyfracs_arr)
 
+        # [mass-dep scatter 2026-08-29] Layer-0 sigma(M, z) per (patch, z, lnM),
+        # from the survey scatter class (get_std_x, the x-dependent counterpart
+        # of the get_cov idiom above). When gated OFF: a (n_patches, n_z, 1)
+        # dummy — the kernel ignores it at trace time (closure flag False).
+        if self._xdep_scatter_on:
+            ln_M_np = np.asarray(self.ln_M, dtype=np.float64)
+            sx_rows = []
+            for i in range(self.n_patches):
+                sx_i = self.scatter.get_std_x(
+                    observable1=obs_select, observable2=obs_select,
+                    layer=0, lnM=ln_M_np, other_params={"zc": zc_grid_np,
+                                                        "patch": i})
+                sx_i = jnp.asarray(sx_i, dtype=jnp.float64)
+                assert sx_i.shape == (n_zv, len(ln_M_np)), (
+                    f"get_std_x must return (n_z, n_lnM); got {sx_i.shape}")
+                sx_rows.append(sx_i)
+            sigma_x_l0 = jnp.stack(sx_rows)
+        else:
+            sigma_x_l0 = jnp.zeros((self.n_patches, n_zv, 1), dtype=jnp.float64)
+
         (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
          abundance_matrix_out, n_z_vec_out, n_tot_out,
          self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
             self.hmf_matrix, self.ln_M, self.obs_select_vec, self.redshift_vec,
             all_layer_args_patched, all_deriv_args_patched,
             all_scatters, all_cutoff_vals, all_apply_cutoffs,
-            sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac)
+            sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac,
+            sigma_x_l0)
 
         if self.cnc_params["compute_abundance_matrix"] == True:
             self.abundance_matrix = abundance_matrix_out
@@ -2383,6 +2555,28 @@ class cluster_number_counts:
             all_cut_val_sets = tuple(all_cut_val_sets)
             all_meancut_val_sets = tuple(all_meancut_val_sets)
 
+            # [mass-dep scatter 2026-08-29] Per-cluster layer-0 sigma(M, z)
+            # tables for the x-dep 1D backward conv: (n_bc, n_ref) per set,
+            # evaluated on the abundance log-M grid (the reference table the
+            # kernel interpolates onto each cluster's own mass grid). Only the
+            # selection observable's 1-obs set gets a real table; every other
+            # set gets a (n_bc, 1) dummy (its kernel ignores it at trace time).
+            lnM_ref_sx = jnp.asarray(self.ln_M, dtype=jnp.float64)
+            all_sigma_x = []
+            for obs_names in self._bc_set_obs:
+                if self._xdep_scatter_on and obs_names == [obs_select_key]:
+                    sx = self.scatter.get_std_x(
+                        observable1=obs_select_key, observable2=obs_select_key,
+                        layer=0, lnM=np.asarray(self.ln_M, dtype=np.float64),
+                        other_params={"zc": self._bc_cached['z_np']})
+                    sx = jnp.asarray(sx, dtype=jnp.float64)
+                    assert sx.shape == (n_bc, len(self.ln_M)), (
+                        f"get_std_x must return (n_bc, n_lnM); got {sx.shape}")
+                    all_sigma_x.append(sx)
+                else:
+                    all_sigma_x.append(jnp.zeros((n_bc, 1), dtype=jnp.float64))
+            all_sigma_x = tuple(all_sigma_x)
+
             bc_chunk = int(self.cnc_params.get("bc_chunk_size", 0))
             n_points_dl = int(self.cnc_params["n_points_data_lik"])
 
@@ -2612,7 +2806,8 @@ class cluster_number_counts:
                     patch_clusters,
                     obs_vals_1l, has_obs_1l,
                     pref_sr_1l, l0_sr_1l, l0_pc_1l, cov_1l,
-                    pre_nd_cpdfs)
+                    pre_nd_cpdfs,
+                    all_sigma_x, lnM_ref_sx)
             else:
                 # Chunked: process bc_chunk clusters at a time
                 log_liks_list = []
@@ -2648,7 +2843,8 @@ class cluster_number_counts:
                         patch_clusters[sl],
                         obs_1l_sl, has_1l_sl,
                         pref_sr_1l, l0_sr_1l, l0_pc_1l_sl, cov_1l,
-                        pre_nd_chunk)
+                        pre_nd_chunk,
+                        tuple(s[sl] for s in all_sigma_x), lnM_ref_sx)
                     log_liks_list.append(ll)
                     cpdf_list.append(cw)
                     lnM_list.append(lm)
