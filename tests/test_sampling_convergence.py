@@ -29,7 +29,8 @@ import jax.numpy as jnp
 import time
 import sys
 
-sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
 
 import cosmocnc_jax
 from cosmocnc_jax.sim import catalogue_generator
@@ -332,7 +333,7 @@ def main():
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    outpath = '/scratch/scratch-izubeldia/planck_cosmology/figures/sampling_convergence.pdf'
+    outpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sampling_convergence.pdf')
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
     plt.savefig(outpath)
     print(f"\nPlot saved to {outpath}")
