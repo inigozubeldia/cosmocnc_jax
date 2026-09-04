@@ -2234,6 +2234,11 @@ class cluster_number_counts:
                 patch_all = jnp.asarray(
                     self.catalogue.catalogue_patch[self.cnc_params["obs_select"]][indices_obs_select]
                 ).astype(jnp.int32)
+                _pa_np = np.asarray(patch_all)
+                if _pa_np.size and (_pa_np.min() < 0 or _pa_np.max() >= self.n_patches):
+                    raise ValueError(
+                        f"catalogue_patch['{self.cnc_params['obs_select']}'] holds patch indices "
+                        f"outside [0, {self.n_patches}) for clusters with only the selection observable")
 
                 # Grid metadata for bilinear interpolation (regular grids)
                 z0 = self.redshift_vec[0]
@@ -2316,6 +2321,11 @@ class cluster_number_counts:
                 obs_select_key = self.cnc_params["obs_select"]
                 patch_clusters = jnp.asarray(
                     self.catalogue.catalogue_patch[obs_select_key])[idx_bc].astype(jnp.int32)
+                _pc_np = np.asarray(patch_clusters)
+                if _pc_np.size and (_pc_np.min() < 0 or _pc_np.max() >= self.n_patches):
+                    raise ValueError(
+                        f"catalogue_patch['{obs_select_key}'] holds patch indices outside "
+                        f"[0, {self.n_patches}) for clusters in the backward-convolution set")
                 skyfracs_arr = jnp.array(self.scal_rel_selection.skyfracs)
                 skyfracs_clusters = skyfracs_arr[patch_clusters]
                 # ── Pattern groups: cluster indices per availability pattern per 2D+ set ──
