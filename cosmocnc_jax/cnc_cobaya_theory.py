@@ -9,8 +9,8 @@ from .utils import *
 
 # Complete list of cnc_params this Cobaya theory passes to cnc.cnc_params.
 # Every key here MUST be a declared class attribute of `cnc` below, and the
-# Cobaya YAML is expected to pin every one of them explicitly (from the project
-# baseline, cosmocnc_params_baseline_jax.py). Keeping this list complete is what
+# Cobaya YAML is expected to pin every one of them explicitly (from the calling
+# analysis' baseline configuration). Keeping this list complete is what
 # guarantees no parameter is silently dropped: if a cnc_param is added to
 # cosmocnc_jax/params.py, add it here (and declare it below) too.
 _CNC_PARAM_KEYS = (
@@ -86,20 +86,20 @@ _COSMO_INPUT_PARAMS = (
     "tau_reio", "w0",
 )
 _SR_INPUT_PARAMS = (
-    # Planck SZiFi
+    # SZ matched-filter S/N scaling relation
     "A_szifi", "alpha_szifi", "sigma_lnq_szifi", "beta_szifi", "bias_sz",
     "corr_lnq_wl",   # [2026-08-12] SZ-lnq x WL-lnM layer-0 scatter correlation
-    "alpha2_szifi",  # [2026-08-18] running of the SZ mass exponent (curv model)
-    "beta2_szifi",   # [2026-08-18] running of the SZ E(z) exponent (curv model)
-    "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq (sigz model)
-    "sigma_lnq_m_szifi", # [2026-08-29] mass-running of sigma_lnq (mass-dep scatter model)
-    "dalpha_szifi",  # [2026-08-19] faint-end slope offset (two-slope model)
+    "alpha2_szifi",  # [2026-08-18] running of the SZ mass exponent
+    "beta2_szifi",   # [2026-08-18] running of the SZ E(z) exponent
+    "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq
+    "sigma_lnq_m_szifi", # [2026-08-29] mass-running of sigma_lnq
+    "dalpha_szifi",  # [2026-08-19] faint-end slope offset (broken power law)
     "q_cutoff",      # [2026-08-27] selection cutoff as a sampled nuisance; when not
                      # sampled, calculate() falls back to the cnc_params mirror
     "dof",           # [2026-08-27] same, for optional dof-marginalization variants
     "q_true_cutoff", # [2026-08-28] pre-dof truncation variable as a sampled nuisance
     "q_mean_cutoff", # [2026-08-28] pre-intrinsic-scatter (mean) truncation as a sampled nuisance
-    # DES Y3 WL 10-parameter Magneticum calibration
+    # weak-lensing 10-parameter calibration (mass slopes + per-z-bin bias/scatter amplitudes)
     "b_wl_m", "s_wl_m", "b_wl_0", "b_wl_1", "b_wl_2", "b_wl_3",
     "s_wl_0", "s_wl_1", "s_wl_2", "s_wl_3",
     # CMB-lensing bias nuisances
@@ -231,8 +231,8 @@ class cnc(classy):
     # Additional cnc_params (declared so they can be pinned from the YAML and
     # passed through to cnc.cnc_params; defaults below mirror the GENERIC
     # cosmocnc_jax/params.py -- this is a shared library file, so it must not
-    # bake in project-baseline values. The YAML is expected to set ALL cnc_params
-    # explicitly from the project baseline -- see cosmocnc_params_baseline_jax.py).
+    # bake in analysis-specific values. The YAML is expected to set ALL cnc_params
+    # explicitly from the calling analysis' baseline configuration.)
     # (n_z_error_integral / z_error_* / stacked_data / compute_stacked_cov are
     #  already declared above; not repeated here.)
     pad_abundance: Optional[bool] = False
@@ -392,7 +392,7 @@ class cnc(classy):
         # convolve_nz/sigma_nz, non_validated_clusters,
         # class_sz_use_m{2,5}00c_in_ym_relation) AND priors/theta_mc_prior, which
         # the block above did not set. The YAML pins all of these from the
-        # project baseline (cosmocnc_params_baseline_jax.py); see _CNC_PARAM_KEYS.
+        # calling analysis' baseline configuration; see _CNC_PARAM_KEYS.
         for _key in _CNC_PARAM_KEYS:
             self.cnc.cnc_params[_key] = getattr(self, _key)
         # restore int/float types for the shape/size params
@@ -497,8 +497,8 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"sigma_lnq_m_szifi")  # [2026-08-29]
         assign_parameter_value(scal_rel_params,params_values,"dalpha_szifi")   # [2026-08-19]
 
-        # DES Y3 WL — 10-parameter Magneticum B13 calibration (joint Gaussian
-        # prior from wl_prior_magneticum_4sigma_trim.npz; see CLAUDE.md).
+        # weak-lensing 10-parameter calibration (mass slopes + per-z-bin
+        # bias/scatter amplitudes; joint Gaussian prior supplied by the analysis).
         assign_parameter_value(scal_rel_params,params_values,"b_wl_m")
         assign_parameter_value(scal_rel_params,params_values,"s_wl_m")
         assign_parameter_value(scal_rel_params,params_values,"b_wl_0")
@@ -511,7 +511,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"s_wl_3")
 
         # CMB lensing — generic per-cluster bias nuisances (3-D joint Gaussian
-        # prior from cmblensing_prior_magneticum_corr.npz) + overall amplitude.
+        # prior supplied by the analysis) + overall amplitude.
         assign_parameter_value(scal_rel_params,params_values,"a_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"alpha_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"beta_beta_generic")

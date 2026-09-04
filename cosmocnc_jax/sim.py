@@ -517,7 +517,7 @@ class catalogue_generator:
 
                     # Vectorised cov build: call scatter.get_cov ONCE per (i, j)
                     # with array zc. For z-dependent observables (e.g. shear
-                    # via Magneticum), it returns (n_clusters,); for constant
+                    # via a z-binned calibration), it returns (n_clusters,); for constant
                     # observables it returns a scalar that broadcasts.
                     cov_batched = np.zeros((n_clusters, n_obs_set, n_obs_set),
                                             dtype=np.float64)

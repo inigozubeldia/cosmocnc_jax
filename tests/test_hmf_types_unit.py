@@ -2,8 +2,8 @@
 (2026-08-14). Self-contained (cosmocncenv, CPU, ~1 min): formula-level and
 machinery-level identities that must hold EXACTLY or to quantified quadrature
 accuracy. External-package cross-checks (hmf package, CCToolkit end-to-end)
-live in planck_cosmology/hmf_newtypes_external.py (isolated audit env);
-end-to-end NumPy<->JAX pipeline parity in planck_cosmology/hmf_newtypes_parity.py.
+and end-to-end NumPy<->JAX pipeline parity live in the calling analysis' own
+test suite.
 
 Tests:
   T1  Tinker10 triple parity (JAX-jit / JAX-class / NumPy) — dense z x Delta x
@@ -32,8 +32,9 @@ os.environ["XLA_FLAGS"] = ""
 import sys
 import numpy as np
 
-sys.path.insert(0, "/scratch/scratch-izubeldia/cosmocnc_jax")
-sys.path.insert(0, "/scratch/scratch-izubeldia/cosmocnc")
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # this repo
+sys.path.insert(0, _REPO)
+sys.path.insert(0, os.path.join(os.path.dirname(_REPO), "cosmocnc"))    # sibling NumPy cosmocnc checkout
 
 import jax
 jax.config.update("jax_enable_x64", True)

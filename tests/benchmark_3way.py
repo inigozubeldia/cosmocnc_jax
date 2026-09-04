@@ -2,7 +2,7 @@
 3-way benchmark: cosmocnc (NumPy CPU) vs cosmocnc_jax (JAX CPU) vs cosmocnc_jax (JAX GPU)
 
 Run with:
-  source /scratch/scratch-izubeldia/cosmocncenv/bin/activate
+  source <your-venv>/bin/activate
   python tests/benchmark_3way.py
 """
 import os
@@ -40,7 +40,8 @@ if _MODE in ("jax_cpu", "jax_gpu"):
     import jax.numpy as jnp
     import numpy as np
 
-    sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+    _REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+    sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
     import cosmocnc_jax
 
     SHARED_PARAMS = {
@@ -142,7 +143,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import numpy as np
 
-sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
 import cosmocnc
 import cosmocnc_jax
 

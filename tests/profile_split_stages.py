@@ -15,7 +15,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import time, sys
-sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
 import cosmocnc_jax
 
 print(f"JAX backend: {jax.default_backend()}")

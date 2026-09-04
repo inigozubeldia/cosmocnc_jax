@@ -13,7 +13,7 @@ import time
 # ---- theta_MC helper: universal massive-neutrino energy-density ratio g(y) = rho(y)/rho_massless ----
 # Used by get_theta_mc to reproduce CAMB cosmomc_theta with the exact massive-neutrino background
 # (y = a * m_nu / T_nu0). Cosmology-independent, so tabulated once at import (numpy, no scipy).
-# See planck_cosmology/verify_theta_mc_analytic.py for the validation.
+# Validated against camb.cosmomc_theta() (agreement ~1.5e-5).
 _THETA_T_CMB_K = 2.7255                                            # consistent with Ogamma0 = 2.47282e-5
 _THETA_T_NU0_EV = (4. / 11.)**(1. / 3.) * _THETA_T_CMB_K * 8.617333262e-5
 
@@ -891,8 +891,7 @@ class cosmology_model:
         #   rs    : int_{1e-8}^{astar} da/(a^2 (H/c) sqrt(3(1+R))), R = 3e4 a ombh2 (CAMB dsound_da_approx),
         #           H(a) analytic with the exact massive-nu density via the universal g(y) table
         #   D_C   : ra_rec (der emulator, current) + analytic high-z correction z_rec->zstar
-        # Verified vs camb.cosmomc_theta() to ~1.5e-5 and vs the NumPy classy-H method to ~1.7e-5
-        # (planck_cosmology/verify_theta_mc_analytic.py).
+        # Verified vs camb.cosmomc_theta() to ~1.5e-5 and vs the NumPy classy-H method to ~1.7e-5.
 
         h = self.cosmo_params["h"]
         H0_over_c = (h*100.)/(constants().c_light/1e3)            # H0/c in 1/Mpc

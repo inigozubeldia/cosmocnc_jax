@@ -16,7 +16,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import time, sys
-sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
 import cosmocnc_jax
 from cosmocnc_jax.utils import _circular_convolve, eval_gaussian_nd, get_mesh, gaussian_1d
 

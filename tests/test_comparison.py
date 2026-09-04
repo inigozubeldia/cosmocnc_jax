@@ -44,7 +44,8 @@ import time
 import sys
 
 # Fix sys.path to avoid cosmocnc_jax/cosmocnc shadowing installed packages
-sys.path = [p for p in sys.path if p not in ('', '.', '/scratch/scratch-izubeldia')]
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # directory containing this repo
+sys.path = [p for p in sys.path if p not in ('', '.', _REPO_PARENT)]
 
 # ── Configuration (shared between both packages) ────────────────────────────
 

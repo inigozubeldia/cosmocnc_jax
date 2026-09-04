@@ -2510,7 +2510,7 @@ class cluster_number_counts:
             # covariance matrix. For observables whose scatter is z-independent
             # (e.g. q_szifi, p_obs), get_cov returns a scalar and broadcasts
             # across the cluster axis; for shear_des_y3 layer 0, get_cov(z_cluster=...)
-            # returns an (n_bc,) array via the Magneticum B13 z-dependent scatter.
+            # returns an (n_bc,) array via a simulation-calibrated z-dependent scatter.
             all_cov_layer0 = []
             all_cov_layer1 = []
             all_apply_cut_sets = []
@@ -2518,7 +2518,7 @@ class cluster_number_counts:
             all_meancut_val_sets = []   # [q_mean_cutoff 2026-08-28]
             # Per-cluster z passed through the standard NumPy idiom
             # other_params['zc'] — vectorised: scatter classes that depend on
-            # z (e.g. Planck shear via Magneticum) consume this as an (n_bc,)
+            # z (e.g. a z-binned weak-lensing calibration) consume this as an (n_bc,)
             # numpy array; classes that don't ignore it.
             cov_other_params = {"zc": self._bc_cached['z_np']}
 
@@ -3030,7 +3030,7 @@ class cluster_number_counts:
             # tiled per patch) and a per-cluster block (sliced by
             # `stacked_cluster_indices` and passed via vmap in_axes=0).
             # The mean_fn signature concatenates them: (..., *per_cluster_args,
-            # *shared_args, ...). See survey_sr_planck_szifi_jax.py for the
+            # *shared_args, ...). See a survey file's stacked mean_fn for the
             # contract.
             mean_fn_sr_shared_patched = _tile_to_patches(
                 stacked_sr.get_mean_fn_sr_params(self.scal_rel_params), n_p)
@@ -3065,7 +3065,7 @@ class cluster_number_counts:
                 mean_fn_sr_per_cluster = ()
 
             # Layer-0 per-cluster SR params (only used when n_layers_stacked > 1).
-            # These were silently dropped before — see diary 2026-05-20.
+            # These were silently dropped before (fixed 2026-05-20).
             if (n_layers_stacked > 1
                     and hasattr(stacked_sr, "get_layer_sr_params_per_cluster")):
                 _l0_pc_full = stacked_sr.get_layer_sr_params_per_cluster(

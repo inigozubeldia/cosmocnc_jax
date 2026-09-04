@@ -53,8 +53,8 @@ class cnc_likelihood(Likelihood):
             # cobaya's Metropolis step are always False, so once a walker lands
             # there it gets permanently stuck proposing-and-never-accepting
             # until cobaya's own "stuck for N attempts" abort kills the whole
-            # MPI job (desonly_csd3, job 33074708, 2026-08-06: rank 0 hit
-            # N_tot=32,804, log_lik->nan, 23/103,187 accepted before the abort).
+            # MPI job (seen in production: one rank hit an overflowing N_tot,
+            # log_lik -> nan, and accepted almost nothing before the abort).
             return -np.inf
 
         return loglkl
@@ -70,9 +70,8 @@ class joint_gaussian_prior(Likelihood):
     serves multiple priors; instantiate it more than once in the YAML via the
     `class:` key. Mirrors the so_cmb_prior_* / desi_prior_* classes below.
 
-    Used by the Planck SZiFi project for:
-      - DES Y3 WL 10-D Magneticum prior  (wl_prior_magneticum_4sigma_trim.npz)
-      - CMB-lensing 3-D generic-bias prior (cmblensing_prior_magneticum_corr.npz)
+    Typical uses: a multi-parameter weak-lensing mass-calibration prior, or a
+    CMB-lensing bias prior, each stored as an npz by the calling analysis.
     """
 
     prior_file: Optional[str] = None
@@ -98,22 +97,25 @@ class joint_gaussian_prior(Likelihood):
                 f"cov {cov.shape}.")
 
         # [2026-07-08 audit hardening] Guard against a silently transposed/reordered
-        # prior: for the KNOWN prior files, the npz's own `names` field must be in
+        # prior: for the KNOWN parameter sets, the npz's own `names` field must be in
         # the exact order that maps positionally onto params_order (shape alone
-        # cannot catch a reorder). Unknown files: pairing is logged for inspection.
+        # cannot catch a reorder). Keyed by params_order so it holds whatever the npz
+        # is called. Unknown sets: pairing is logged for inspection.
         _known_orders = {
-            "wl_prior_magneticum_4sigma_trim.npz":
+            ("b_wl_m", "s_wl_m", "b_wl_0", "s_wl_0", "b_wl_1", "s_wl_1",
+             "b_wl_2", "s_wl_2", "b_wl_3", "s_wl_3"):
                 ["alpha", "alpha_sigma", "b0", "s0", "b1", "s1", "b2", "s2", "b3", "s3"],
-            "cmblensing_prior_magneticum_corr.npz":
+            ("a_beta_generic", "alpha_beta_generic", "beta_beta_generic"):
                 ["a_beta", "alpha_beta", "beta_beta"],
         }
         _base = os.path.basename(str(self.prior_file))
+        _key = tuple(self._params)
         if "names" in data:
             _names = [str(x) for x in np.atleast_1d(data["names"])][:n]
-            if _base in _known_orders and _names != _known_orders[_base]:
+            if _key in _known_orders and _names != _known_orders[_key]:
                 raise ValueError(
                     f"joint_gaussian_prior: npz 'names' order in '{_base}' is "
-                    f"{_names}, expected {_known_orders[_base]} — the positional "
+                    f"{_names}, expected {_known_orders[_key]} — the positional "
                     "map onto params_order would be WRONG (2026-07-08 hardening).")
             self.log.info("joint_gaussian_prior positional map: %s",
                           list(zip(_names, self._params)))
