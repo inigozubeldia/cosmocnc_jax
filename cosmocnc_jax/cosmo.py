@@ -875,6 +875,12 @@ class cosmology_model:
     def _init_camb_backend(self):
         import camb as _camb
         self._camb = _camb
+        # The emulator backends switch float64 on as a side effect of importing classy_szfast; this
+        # backend imports no such package, so the caller must enable it explicitly (the mass-conversion
+        # Newton loops and the FFTLog sigma(M) path require float64 and fail obscurely without it).
+        if not jax.config.jax_enable_x64:
+            raise RuntimeError("cosmology_tool='camb' requires jax.config.update('jax_enable_x64', True) "
+                               "before the model is built (float64 is not enabled in this process)")
         if self.cnc_params["cosmo_model"] != "mnu":
             raise ValueError("cosmology_tool='camb' implements cosmo_model='mnu' (flat LCDM + one "
                              f"massive neutrino state); got {self.cnc_params['cosmo_model']!r}")
