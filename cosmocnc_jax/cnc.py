@@ -1721,8 +1721,10 @@ class cluster_number_counts:
 
         #Evaluate some useful quantities (to be potentially passed to scaling relations)
 
-        if self.cnc_params["cosmology_tool"] == "classy_sz_jax":
+        if self.cnc_params["cosmology_tool"] in ("classy_sz_jax", "camb"):
             # === Fast path: direct emulator calls (no Cython, no monkey-patching) ===
+            # [2026-09-04] the "camb" backend exposes the same _pvd/_emu_param_orders/_predict_*
+            # interface (cosmo.py: _init_camb_backend), evaluating CAMB instead of the emulators.
             from cosmocnc_jax.emulators import build_cosmo_vec
             _pvd = self.cosmology._pvd
             _h = self.cosmology.cosmo_params["h"]
@@ -1786,8 +1788,8 @@ class cluster_number_counts:
 
                 delta_num = float(self.cnc_params["mass_definition"][0:-1])
 
-                # === Fast JAX path: direct emulator calls ===
-                if self.cnc_params["cosmology_tool"] == "classy_sz_jax":
+                # === Fast JAX path: direct emulator calls (or the CAMB P(k,z) table) ===
+                if self.cnc_params["cosmology_tool"] in ("classy_sz_jax", "camb"):
 
                     # Batch P(k) from direct PKL emulator (JIT'd, vmapped)
                     pkl_keys = [k for k in cosmo._emu_param_orders['pkl']

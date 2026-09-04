@@ -55,6 +55,26 @@ _DEG_NCDM_PER_MODEL = {
 # (classy default T_ncdm/T_gamma ratio with instantaneous decoupling).
 _NCDM_NEFF_CONTRIBUTION = 1.0132
 
+# ---- CAMB backend constants (cosmology_tool="camb") -----------------------------------------
+# The k grid of the classy_szfast PKL emulator (cszfast_pk_grid_k) is exactly
+# geomspace(1e-4, 48.832595299452, 500) Mpc^-1 (verified 2026-09-04 to 1.7e-15). The CAMB
+# backend tabulates P(k,z) on the SAME grid so that the FFTLog sigma(M) machinery downstream
+# (mcfit TophatVar objects, batch_sigma_R_from_tophat, compute_hmf_matrix_jit) is byte-identical
+# across backends: only the cosmology INPUT changes.
+_CAMB_K_ARR = np.geomspace(1e-4, 48.832595299452, 500)
+_CAMB_T_CMB_K = 2.7255          # CAMB default TCMB; also classy's T_cmb()
+_CAMB_N_EFF = 3.046             # nnu passed to CAMB (1 massive state + massless remainder)
+_CAMB_C_KMS = 299792.458
+# Emulator-shaped parameter orders. The CAMB backend's _predict_* functions IGNORE the cosmo_vec
+# argument (they read the current CAMB tables), but consumers build that vector via
+# build_cosmo_vec(cosmo._pvd, cosmo._emu_param_orders[key]) -- every key must exist in _pvd.
+_CAMB_PARAM_ORDERS = {
+    "h": ["H0", "omega_b", "omega_cdm", "n_s", "ln10^{10}A_s", "tau_reio", "m_ncdm"],
+    "da": ["H0", "omega_b", "omega_cdm", "n_s", "ln10^{10}A_s", "tau_reio", "m_ncdm"],
+    "pkl": ["H0", "omega_b", "omega_cdm", "n_s", "ln10^{10}A_s", "tau_reio", "m_ncdm", "z_pk_save_nonclass"],
+    "der": ["H0", "omega_b", "omega_cdm", "n_s", "ln10^{10}A_s", "tau_reio", "m_ncdm"],
+}
+
 
 def _import_hmfast(hmfast_path=None):
     """Import the hmfast package, optionally forcing it to come from
@@ -94,6 +114,7 @@ class cosmology_model:
 
         self.cosmo_params = cosmo_params
         self.amplitude_parameter = amplitude_parameter
+        self._cosmology_tool = cosmology_tool
 
         self.logger.info(f'Cosmology params: {self.cosmo_params}')
         # if self.cnc_params["cosmo_model"] != self.cnc_params["class_sz_cosmo_model"]:
@@ -307,6 +328,14 @@ class cosmology_model:
 
             self._build_params_values_dict()
             self._init_hmfast_cosmology()
+
+        elif cosmology_tool == "camb":
+
+            # Boltzmann-code backend (no emulators): one CAMB call per cosmology update gives
+            # the linear P(k,z) on the emulator k grid, H(z), D_A(z), theta_MC, z_star, D_CMB.
+            # Everything downstream (FFTLog sigma(M), Tinker08, abundance, backward conv) is
+            # the same JAX code the classy_sz_jax fast path runs. See _init_camb_backend.
+            self._init_camb_backend()
 
         print("cosmo params",self.cosmo_params)
 
@@ -791,6 +820,205 @@ class cosmology_model:
         Oncdm = deg_ncdm * m_ncdm / (93.14 * h**2)
         self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
 
+    # --------------------------------------------------------------
+    # CAMB backend (cosmology_tool="camb")
+    # --------------------------------------------------------------
+    #
+    # Motivation: the classy_szfast cosmopower emulators are trained on a finite parameter box
+    # (omega_cdm in [0.080, 0.200], ln10^10A_s in [2.5, 3.5], ...) and extrapolate silently
+    # outside it. This backend replaces the four emulators (pkl, h, da, der) by a Boltzmann
+    # code, keeping the rest of the pipeline untouched:
+    #
+    #   * ONE camb.get_results() per update_cosmology (~1.4 s at AccuracyBoost 1 on 4 cores;
+    #     the retrieved linear P(k) is converged to 1e-4, the background exactly).
+    #   * P(k,z): CAMB's linear matter power (var `camb_pk_var`, default delta_tot = total
+    #     matter, the PKL emulator's convention) via get_matter_power_interpolator, evaluated
+    #     on the emulator k grid _CAMB_K_ARR at the production redshift grid
+    #     linspace(z_min, z_max, n_z); other redshifts are cubic-interpolated in z (ln P).
+    #   * sigma_8 -> A_s: EXACT. CAMB runs at a reference A_s; sigma_8 of the tabulated z=0
+    #     P(k) is computed with a fine top-hat quadrature and, since P_lin is proportional to
+    #     A_s, the table is rescaled by (sigma8_target/sigma8_ref)^2 and A_s follows. So the
+    #     P(k) fed to the HMF has EXACTLY the sampled sigma_8 under the code's own top-hat
+    #     definition (the emulator path matches its own DER sigma_8 to ~2e-4).
+    #   * H(z), D_A(z): CAMB's background evaluated directly at every requested z (no table).
+    #   * theta_MC: CAMB's cosmomc_theta() (get_theta_mc returns it for this backend);
+    #     z_CMB = CAMB's z_star, D_CMB = D_A(z_star).
+    #   * Omega budget for the Delta_mean(z) conversion and the sigma-based mass conversion:
+    #     _set_om_budget with Oncdm = m_nu/(93.14 h^2), the same convention as the other
+    #     backends (CAMB's own omnuh2 differs by 0.1%, i.e. 7e-7 in Omega -- irrelevant).
+    #
+    # Interface: the backend exposes the SAME attributes the classy_sz_jax fast path in
+    # cnc.get_hmf / _compute_sigma_M_at_z / the survey files consume (_pvd,
+    # _emu_param_orders, _k_arr, _predict_H, _predict_DA, _predict_pk_batch, D_CMB, z_CMB,
+    # sigma8, _Omega_m_z_nonu, background_cosmology/power_spectrum wrappers). The _predict_*
+    # functions take the (cosmo_vec, z) signature for that reason but IGNORE cosmo_vec: they
+    # read the current CAMB results object, which update_cosmology refreshes.
+
+    def _resolve_density_params(self):
+        """Fill Ob0/Om0 or Ob0h2/Oc0h2 from the other pair per cosmo_param_density
+        (same three-way logic as the classy_sz_jax and hmfast branches)."""
+        cp = self.cosmo_params
+        h = cp["h"]
+        mode = self.cnc_params["cosmo_param_density"]
+        if mode == "critical":
+            cp["Ob0h2"] = cp["Ob0"] * h**2
+            cp["Oc0h2"] = (cp["Om0"] - cp["Ob0"]) * h**2
+        elif mode == "physical":
+            cp["Ob0"] = cp["Ob0h2"] / h**2
+            cp["Om0"] = (cp["Oc0h2"] + cp["Ob0h2"]) / h**2
+        elif mode == "mixed":
+            cp["Ob0"] = cp["Ob0h2"] / h**2
+            cp["Oc0h2"] = (cp["Om0"] - cp["Ob0"]) * h**2
+        else:
+            raise ValueError(f"unknown cosmo_param_density {mode!r}")
+
+    def _init_camb_backend(self):
+        import camb as _camb
+        self._camb = _camb
+        if self.cnc_params["cosmo_model"] != "mnu":
+            raise ValueError("cosmology_tool='camb' implements cosmo_model='mnu' (flat LCDM + one "
+                             f"massive neutrino state); got {self.cnc_params['cosmo_model']!r}")
+        if self.amplitude_parameter not in ("sigma_8", "A_s"):
+            raise ValueError(f"unknown amplitude parameter {self.amplitude_parameter!r}")
+        self._camb_accuracy_boost = float(self.cnc_params.get("camb_accuracy_boost", 1.0))
+        self._camb_pk_var = str(self.cnc_params.get("camb_pk_var", "delta_tot"))
+        if self._camb_pk_var not in ("delta_tot", "delta_nonu"):
+            raise ValueError(f"camb_pk_var must be 'delta_tot' or 'delta_nonu', got {self._camb_pk_var!r}")
+        self._k_arr = jnp.asarray(_CAMB_K_ARR)
+        self._z_pk_tab = np.linspace(float(self.cnc_params["z_min"]), float(self.cnc_params["z_max"]),
+                                     int(self.cnc_params["n_z"]))
+        assert self._z_pk_tab[0] > 0.0, "camb backend: z_min must be > 0 (z=0 is added internally)"
+        self.T_CMB_0 = _CAMB_T_CMB_K
+        self.N_eff = _CAMB_N_EFF
+        self._emu_param_orders = {k: list(v) for k, v in _CAMB_PARAM_ORDERS.items()}
+        self._resolve_density_params()
+        self._camb_As_ref = float(self.cosmo_params.get("A_s", 2.1e-9))
+        self._build_params_values_dict()
+        self._camb_run()
+        self._camb_build_wrappers()
+        # mass-conversion helpers: the production path uses the JAX-native sigma-based grid
+        # (compute_log_m500c_over_m200c_grid -> _compute_sigma_M_at_z); the classy Cython
+        # helpers have no CAMB counterpart.
+        self.get_delta_mean_from_delta_crit_at_z = np.vectorize(
+            lambda delta_crit, z: float(delta_crit) / float(self._Omega_m_z_nonu(jnp.float64(z)))
+        )
+        self.get_m500c_to_m200c_at_z_and_M = self._not_implemented_mass_conv("m500c->m200c")
+        self.get_m200c_to_m500c_at_z_and_M = self._not_implemented_mass_conv("m200c->m500c")
+        self.get_c200c_at_m_and_z = self._not_implemented_mass_conv("c200c")
+        self.get_dndlnM_at_z_and_M = self._not_implemented_mass_conv("dndlnM")
+        self.logger.info(f"camb backend initialised: CAMB {self._camb.__version__}, AccuracyBoost "
+                         f"{self._camb_accuracy_boost}, P(k) var {self._camb_pk_var}, n_k {len(_CAMB_K_ARR)}, "
+                         f"n_z(P) {len(self._z_pk_tab)}; sigma8 {self.sigma8:.6f} -> ln10^10A_s "
+                         f"{self._pvd['ln10^{10}A_s']:.6f}; theta_MC {self._camb_theta_mc:.8f}")
+
+    @staticmethod
+    def _camb_tophat_sigma(k, pk, R, n_fine=20000):
+        """sigma(R) = sqrt( int dlnk k^3 P(k) W^2(kR) / (2 pi^2) ) on a fine log grid
+        (log-log interpolation of the tabulated P). k in Mpc^-1, P in Mpc^3, R in Mpc."""
+        k = np.asarray(k, dtype=float); pk = np.asarray(pk, dtype=float)
+        assert np.all(pk > 0) and np.all(np.diff(k) > 0)
+        lk = np.linspace(np.log(k[0]), np.log(k[-1]), n_fine)
+        kk = np.exp(lk)
+        P = np.exp(np.interp(lk, np.log(k), np.log(pk)))
+        x = kk * R
+        W = 3.0 * (np.sin(x) - x * np.cos(x)) / x**3
+        return float(np.sqrt(np.trapezoid(kk**3 * P * W**2, lk) / (2.0 * np.pi**2)))
+
+    def _camb_run(self):
+        """One CAMB evaluation at the current cosmo_params: fills the P(k,z) table (rescaled to
+        the sampled sigma_8 when that is the amplitude parameter), the results object used for
+        H(z)/D_A(z), theta_MC, z_CMB, D_CMB, sigma8, A_s, and the Omega budget."""
+        camb = self._camb
+        cp = self.cosmo_params
+        h = float(cp["h"])
+        ombh2 = float(cp["Ob0h2"]); omch2 = float(cp["Oc0h2"])
+        m_nu = float(cp.get("m_nu", 0.06)); tau = float(cp["tau_reio"]); n_s = float(cp["n_s"])
+        As_run = self._camb_As_ref if self.amplitude_parameter == "sigma_8" else float(cp["A_s"])
+        assert np.isfinite([h, ombh2, omch2, m_nu, tau, n_s, As_run]).all() and h > 0 and omch2 > 0 and As_run > 0
+
+        p = camb.CAMBparams()
+        p.set_cosmology(H0=100.0 * h, ombh2=ombh2, omch2=omch2, mnu=m_nu, num_massive_neutrinos=1,
+                        nnu=_CAMB_N_EFF, tau=tau, TCMB=_CAMB_T_CMB_K)
+        p.InitPower.set_params(As=As_run, ns=n_s)
+        p.set_accuracy(AccuracyBoost=self._camb_accuracy_boost)
+        # kmax: the docstring says "k is just k, not k/h" (Mpc^-1); 1.2*kmax/h covers the
+        # emulator grid under either reading. The interpolator's kmax is asserted below.
+        p.set_matter_power(redshifts=list(np.concatenate([self._z_pk_tab, [0.0]])),
+                           kmax=1.2 * float(_CAMB_K_ARR[-1]) / h, silent=True)
+        p.NonLinear = camb.model.NonLinear_none
+        p.WantCls = False
+        r = camb.get_results(p)
+        self._camb_results = r
+
+        PK = r.get_matter_power_interpolator(nonlinear=False, var1=self._camb_pk_var, var2=self._camb_pk_var,
+                                             hubble_units=False, k_hunit=False, log_interp=True, extrap_kmax=None)
+        assert PK.kmin <= _CAMB_K_ARR[0] and PK.kmax >= _CAMB_K_ARR[-1], \
+            f"camb backend: interpolator k range [{PK.kmin}, {PK.kmax}] does not cover the emulator grid"
+        assert PK.zmin <= 0.0 and PK.zmax >= self._z_pk_tab[-1]
+        pk_tab = np.asarray([PK.P(float(z), _CAMB_K_ARR) for z in self._z_pk_tab], dtype=float)   # (n_z, n_k) Mpc^3
+        pk_z0 = np.asarray(PK.P(0.0, _CAMB_K_ARR), dtype=float)
+        assert np.isfinite(pk_tab).all() and (pk_tab > 0).all() and pk_tab.shape == (len(self._z_pk_tab), len(_CAMB_K_ARR))
+
+        sigma8_ref = self._camb_tophat_sigma(_CAMB_K_ARR, pk_z0, 8.0 / h)
+        if self.amplitude_parameter == "sigma_8":
+            sigma8_target = float(cp["sigma_8"])
+            scale = (sigma8_target / sigma8_ref)**2           # P_lin is exactly proportional to A_s
+            A_s = As_run * scale
+            pk_tab = pk_tab * scale
+            self.sigma8 = sigma8_target
+        else:
+            A_s = As_run
+            self.sigma8 = sigma8_ref
+        self.As = A_s
+        cp["A_s"] = A_s
+        cp["sigma_8"] = self.sigma8
+        self._camb_As_ref = A_s                                # next update starts from here
+        self._pvd["ln10^{10}A_s"] = float(np.log(A_s * 1e10))
+        self._pk_tab = pk_tab
+        self._camb_sigma8_internal = float(r.get_sigma8_0()) * (float(np.sqrt(A_s / As_run)))   # CAMB's own quadrature, for diagnostics
+
+        self._camb_theta_mc = float(r.cosmomc_theta())
+        derived = r.get_derived_params()
+        self.z_CMB = float(derived["zstar"])
+        self.D_CMB = float(r.angular_diameter_distance(self.z_CMB))
+        assert 900.0 < self.z_CMB < 1200.0 and self.D_CMB > 0
+
+        Ob = ombh2 / h**2; Ocdm = omch2 / h**2; Oncdm = m_nu / (93.14 * h**2)
+        self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=1)
+
+    def _camb_pk_at_z(self, z_vec):
+        """Linear P(k,z) on _CAMB_K_ARR at the requested redshifts: the exact table rows when
+        z_vec IS the production grid, else a cubic interpolation of ln P in z (asserted in range)."""
+        z = np.asarray(z_vec, dtype=float).ravel()
+        if z.shape == self._z_pk_tab.shape and np.allclose(z, self._z_pk_tab, rtol=0.0, atol=1e-10):
+            return jnp.asarray(self._pk_tab)
+        assert z.min() >= self._z_pk_tab[0] - 1e-12 and z.max() <= self._z_pk_tab[-1] + 1e-12, \
+            f"camb backend: P(k) requested at z in [{z.min()}, {z.max()}] outside the tabulated [{self._z_pk_tab[0]}, {self._z_pk_tab[-1]}]"
+        from scipy.interpolate import CubicSpline
+        lnP = CubicSpline(self._z_pk_tab, np.log(self._pk_tab), axis=0)(z)
+        return jnp.asarray(np.exp(lnP))
+
+    def _camb_build_wrappers(self):
+        r_get = lambda: self._camb_results
+
+        def _predict_H(cosmo_vec, z_vec):                       # H/c in 1/Mpc (emulator convention)
+            z = np.asarray(z_vec, dtype=float)
+            return jnp.asarray(np.asarray(r_get().hubble_parameter(z), dtype=float) / _CAMB_C_KMS)
+
+        def _predict_DA(cosmo_vec, z_vec):                      # D_A in Mpc
+            z = np.asarray(z_vec, dtype=float)
+            return jnp.asarray(np.asarray(r_get().angular_diameter_distance(z), dtype=float))
+
+        def _predict_pk_batch(cosmo_vec, z_vec):                # (n_z, n_k) P(k,z) in Mpc^3
+            return self._camb_pk_at_z(z_vec)
+
+        self._predict_H = _predict_H
+        self._predict_DA = _predict_DA
+        self._predict_pk_batch = _predict_pk_batch
+        self.power_spectrum = camb_jax_cosmo(self, self.cosmo_params)
+        self.background_cosmology = camb_jax_cosmo(self, self.cosmo_params)
+        self.background_cosmology.H0.value = self.cosmo_params["h"] * 100.
+
 
     def update_cosmology(self,cosmo_params_new,cosmology_tool = "astropy"):
 
@@ -857,6 +1085,14 @@ class cosmology_model:
             self.background_cosmology = hmfast_jax_cosmo(self, self._hmfast_cosmo, self.cosmo_params)
             self.background_cosmology.H0.value = self.cosmo_params["h"] * 100.
 
+        elif cosmology_tool == "camb":
+
+            # One CAMB call at the new cosmology; every table/derived quantity is rebuilt.
+            self._resolve_density_params()
+            self._build_params_values_dict()
+            self._camb_run()
+            self._camb_build_wrappers()
+
         elif cosmology_tool == "cobaya":
 
             cobaya_cosmology = cobaya_cosmo(self.cnc_params)
@@ -892,6 +1128,10 @@ class cosmology_model:
         #           H(a) analytic with the exact massive-nu density via the universal g(y) table
         #   D_C   : ra_rec (der emulator, current) + analytic high-z correction z_rec->zstar
         # Verified vs camb.cosmomc_theta() to ~1.5e-5 and vs the NumPy classy-H method to ~1.7e-5.
+
+        if getattr(self, "_cosmology_tool", None) == "camb":
+            # CAMB backend: the exact CAMBdata.cosmomc_theta() of the current results object.
+            return float(self._camb_theta_mc)
 
         h = self.cosmo_params["h"]
         H0_over_c = (h*100.)/(constants().c_light/1e3)            # H0/c in 1/Mpc
@@ -1165,6 +1405,21 @@ class hmfast_jax_cosmo:
         class result:
             value = hz
         return result
+
+    class H0:
+        value = 0
+
+
+class camb_jax_cosmo(hmfast_jax_cosmo):
+    """Background/power-spectrum wrapper for the CAMB backend. Same API as classy_sz_jax_cosmo
+    (get_linear_power_spectrum, critical_density, differential_comoving_volume,
+    angular_diameter_distance, angular_diameter_distance_z1z2, H, H0). Reuses the
+    hmfast_jax_cosmo implementation, which routes every quantity through the parent
+    cosmology_model's _predict_H / _predict_DA / _predict_pk_batch -- for the CAMB backend
+    those evaluate CAMB's background directly and read the P(k,z) table."""
+
+    def __init__(self, parent_cosmology_model, cosmo_params):
+        super().__init__(parent_cosmology_model, None, cosmo_params)
 
     class H0:
         value = 0

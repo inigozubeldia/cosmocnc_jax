@@ -84,6 +84,11 @@ cnc_params_default = {
     #   fully in JAX. Required for classy_sz_jax.
 
     "cosmology_tool": "classy_sz_jax",
+    # cosmology_tool "camb" (2026-09-04): Boltzmann code instead of the emulators -- one CAMB
+    #   call per cosmology update (linear P(k,z) on the emulator k grid, H, D_A, theta_MC);
+    #   the HMF/abundance/backward-conv path is the same JAX code. cosmo_model "mnu" only.
+    "camb_accuracy_boost": 1.0,      # CAMB AccuracyBoost (1.0: retrieved linear P(k) converged to 1e-4, ~1.4 s/call; 2.0: ~3.9 s)
+    "camb_pk_var": "delta_tot",      # linear P(k) variable fed to sigma(M): "delta_tot" (total matter, the PKL emulator's convention) or "delta_nonu" (cdm+baryons)
     "M_min": 5e13,
     "M_max": 5e15,
     "M_min_extended": None,

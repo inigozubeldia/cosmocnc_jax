@@ -34,7 +34,8 @@ _CNC_PARAM_KEYS = (
     # ranges
     "obs_select_min", "obs_select_max", "z_min", "z_max",
     # cosmology / hmf
-    "cosmology_tool", "M_min", "M_max", "M_min_extended", "M_min_cutoff",
+    "cosmology_tool", "camb_accuracy_boost", "camb_pk_var",   # camb_*: cosmology_tool="camb" only (2026-09-04)
+    "M_min", "M_max", "M_min_extended", "M_min_cutoff",
     "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv", "fft_mode",
     "power_spectrum_type", "cosmo_amplitude_parameter", "cosmo_param_density",
     "scalrel_type_deriv", "sigma_scatter_min", "interp_tinker", "Hubble_parameter",
@@ -168,6 +169,8 @@ class cnc(classy):
     #hmf parameters
 
     cosmology_tool:  Optional[str] = "classy_sz_jax"
+    camb_accuracy_boost: Optional[str] = 1.0        # cosmology_tool="camb" only
+    camb_pk_var: Optional[str] = "delta_tot"        # cosmology_tool="camb" only
     M_min : Optional[str] =  1e13
     M_max : Optional[str] =  1e16
     hmf_calc : Optional[str] =  "cnc" #"cnc", "hmf", or "MiraTitan"
@@ -400,7 +403,7 @@ class cnc(classy):
                      "n_points_data_lik", "bc_chunk_size", "n_z_error_integral",
                      "obs_select_conv_chunk"):
             self.cnc.cnc_params[_key] = int(self.cnc.cnc_params[_key])
-        for _key in ("M_min", "M_max"):
+        for _key in ("M_min", "M_max", "camb_accuracy_boost"):
             self.cnc.cnc_params[_key] = float(self.cnc.cnc_params[_key])
         # get_masses: exposed in the YAML as `compute_masses` (Cobaya reserves
         # the get_* prefix for provider methods) and mapped here.
