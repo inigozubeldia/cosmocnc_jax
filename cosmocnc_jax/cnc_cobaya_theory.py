@@ -50,7 +50,7 @@ _CNC_PARAM_KEYS = (
     # binned likelihood
     "binned_lik_type", "bins_edges_z", "bins_edges_obs_select",
     # stacked likelihood
-    "stacked_likelihood", "stacked_data", "compute_stacked_cov",
+    "stacked_likelihood", "stacked_data", "compute_stacked_cov", "stacked_full_cov",
     # alternative calibration likelihood
     "likelihood_cal_alt", "observables_cal_alt",
     # simulator
@@ -189,6 +189,7 @@ class cnc(classy):
     stacked_likelihood: Optional[str] = False,
     stacked_data: Optional[str] = ["p_zc19_stacked"]
     compute_stacked_cov: Optional[str] = True
+    stacked_full_cov: Optional[str] = False    # full (off-diagonal) theory covariance of vector stacked observables; see cnc.get_log_lik_stacked
 
     likelihood_cal_alt: Optional[str] = False
     observables_cal_alt: Optional[str] = ["p_zc19"]
@@ -358,6 +359,7 @@ class cnc(classy):
         self.cnc.cnc_params["stacked_likelihood"] = self.stacked_likelihood
         self.cnc.cnc_params["stacked_data"] = self.stacked_data
         self.cnc.cnc_params["compute_stacked_cov"] = self.compute_stacked_cov
+        self.cnc.cnc_params["stacked_full_cov"] = self.stacked_full_cov
         self.cnc.cnc_params["Hubble_parameter"] = self.Hubble_parameter
 
         self.cnc.cnc_params["likelihood_cal_alt"] = self.likelihood_cal_alt
