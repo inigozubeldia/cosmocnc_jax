@@ -1063,40 +1063,49 @@ class cluster_number_counts:
         use_analytical = (self.cnc_params.get("scalrel_type_deriv", "analytical") == "analytical")
         self._use_analytical_deriv = use_analytical
 
-        # [mass-dep scatter 2026-08-29] GATE resolution + fail-fast guards.
-        # When ON, the SELECTION observable's LAYER-0 intrinsic scatter may be
-        # any function sigma(M, z), supplied by the survey scatter class via
-        # get_std_x. Supported paths: abundance layer 0 (explicit quadrature)
-        # and the 1D backward conv. Everything else is guarded off loudly.
+        # [mass-dep scatter 2026-08-29; generalised 2026-09-08] GATE resolution
+        # + fail-fast guards. When ON, the LAYER-0 intrinsic scatter of ANY
+        # 2-layer observable that sits alone in its correlation set may be any
+        # function sigma(M, z), supplied by the survey scatter class via
+        # get_std_x for the (obs, obs, 0) pairs it declares in x_dep_scatter.
+        # Supported paths: the 1D backward conv of each declaring set, and the
+        # abundance layer 0 when the SELECTION observable declares. Everything
+        # else is guarded off loudly.
         self._xdep_scatter_on = bool(self.cnc_params.get("mass_dep_scatter", False))
+        self._xdep_abundance = False       # selection observable's layer 0 declared x-dependent
         if self._xdep_scatter_on:
-            if not hasattr(self.scatter, "get_std_x"):
+            if not hasattr(self.scatter, "get_std_x") or not hasattr(self.scatter, "x_dep_scatter"):
                 raise NotImplementedError(
                     "mass_dep_scatter=True but the survey scatter class has no "
+                    "x_dep_scatter(observable1, observable2, layer) / "
                     "get_std_x(observable1, observable2, layer, lnM, other_params)")
-            if not (hasattr(self.scatter, "x_dep_scatter")
-                    and self.scatter.x_dep_scatter(obs_select_name, obs_select_name, 0)):
-                raise NotImplementedError(
-                    "mass_dep_scatter=True but the survey scatter class does not "
-                    f"declare x-dependent scatter for ({obs_select_name}, layer 0)")
-            if sr_sel.get_n_layers() != 2:
-                raise NotImplementedError(
-                    "mass_dep_scatter supports only 2-layer selection observables "
-                    f"(got {sr_sel.get_n_layers()})")
+            _n_declared = 0
             for _oset in self.cnc_params["observables"]:
-                if obs_select_name in _oset and len(_oset) != 1:
-                    raise NotImplementedError(
-                        "mass_dep_scatter=True: the selection observable must be in "
-                        "a 1-observable correlation set (the >=2D backward conv does "
-                        f"not support x-dependent scatter); got set {_oset}")
-            if self.cnc_params.get("stacked_likelihood", False):
-                for _key in self.cnc_params.get("stacked_data", []):
-                    if (self.catalogue.stacked_data[_key]["observable"]
-                            == obs_select_name):
+                for _o in _oset:
+                    _sr_o = self.scaling_relations[_o]
+                    if _sr_o.get_n_layers() < 2 or not self.scatter.x_dep_scatter(_o, _o, 0):
+                        continue
+                    _n_declared += 1
+                    if len(_oset) != 1:
                         raise NotImplementedError(
-                            "mass_dep_scatter=True: the stacked-likelihood path "
-                            "does not support x-dependent scatter for the "
-                            "selection observable")
+                            f"mass_dep_scatter=True: observable {_o} declares x-dependent "
+                            "layer-0 scatter but is not alone in its correlation set (the "
+                            f">=2D backward conv does not support it); got set {_oset}")
+                    if _sr_o.get_n_layers() != 2:
+                        raise NotImplementedError(
+                            "mass_dep_scatter supports only 2-layer observables "
+                            f"(got {_sr_o.get_n_layers()} for {_o})")
+                    if self.cnc_params.get("stacked_likelihood", False):
+                        for _key in self.cnc_params.get("stacked_data", []):
+                            if self.catalogue.stacked_data[_key]["observable"] == _o:
+                                raise NotImplementedError(
+                                    "mass_dep_scatter=True: the stacked-likelihood path "
+                                    f"does not support x-dependent scatter for {_o}")
+            if _n_declared == 0:
+                raise NotImplementedError(
+                    "mass_dep_scatter=True but the survey scatter class declares "
+                    "x-dependent layer-0 scatter for no 2-layer observable")
+            self._xdep_abundance = bool(self.scatter.x_dep_scatter(obs_select_name, obs_select_name, 0))
 
         # ── 1. Backward conv functions per correlation set ──
         # _bc_set_fns: list of (bc_fn, obs_names_in_set) per correlation set
@@ -1104,6 +1113,7 @@ class cluster_number_counts:
         self._bc_obs_list = []     # flat list of all bc observable names
         self._bc_set_fns = []      # list of (bc_fn, obs_names) per correlation set
         self._bc_set_obs = []      # list of obs_name lists per correlation set
+        self._bc_set_xdep = []     # per correlation set: x-dependent layer-0 scatter kernel? [2026-09-08]
         self._all_sets_are_1d = True  # fast-path flag
         self._1layer_obs_list = []   # 1-layer observables (direct PDF, no backward conv)
 
@@ -1141,15 +1151,18 @@ class cluster_number_counts:
 
             # Build N-D backward conv for this correlation set
             nd_circular = self.cnc_params.get("nd_convolution_mode", "linear") == "circular"
+            # [mass-dep scatter 2026-08-29; generalised 2026-09-08] any 1-obs set
+            # whose observable declares x-dependent layer-0 scatter gets the
+            # row-quadrature kernel (guards above); every other set keeps the FFT
+            _xdep_set = bool(self._xdep_scatter_on and n_obs_set == 1
+                             and self.scatter.x_dep_scatter(bc_obs_in_set[0], bc_obs_in_set[0], 0))
             bc_set_fn = build_backward_conv_nd(
                 layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set,
                 nd_circular=nd_circular,
-                # [mass-dep scatter 2026-08-29] only the selection observable's
-                # own 1-obs set gets the x-dep layer-0 kernel (guards above)
-                xdep_scatter_layer0=(self._xdep_scatter_on
-                                     and bc_obs_in_set == [obs_select_name]))
+                xdep_scatter_layer0=_xdep_set)
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
+            self._bc_set_xdep.append(_xdep_set)
 
 
         # ── 2. Mass range function for selection observable ──
@@ -1544,8 +1557,9 @@ class cluster_number_counts:
             # [direct-conv 2026-08-27] STATIC gate (trace-structure choice)
             direct_final_conv=bool(self.cnc_params.get("obs_select_conv_direct", False)),
             direct_chunk=int(self.cnc_params.get("obs_select_conv_chunk", 128)),
-            # [mass-dep scatter 2026-08-29] STATIC gate (trace-structure choice)
-            xdep_scatter_layer0=self._xdep_scatter_on)
+            # [mass-dep scatter 2026-08-29] STATIC gate (trace-structure choice);
+            # [2026-09-08] only when the SELECTION observable declares x-dependence
+            xdep_scatter_layer0=self._xdep_abundance)
 
         # Build vmap axes for all_layer_args (nested tuple)
         # All layers: prefactors (per-z axis 0) + sr_params (shared None)
@@ -2107,14 +2121,15 @@ class cluster_number_counts:
         # from the survey scatter class (get_std_x, the x-dependent counterpart
         # of the get_cov idiom above). When gated OFF: a (n_patches, n_z, 1)
         # dummy — the kernel ignores it at trace time (closure flag False).
-        if self._xdep_scatter_on:
+        if self._xdep_abundance:
             ln_M_np = np.asarray(self.ln_M, dtype=np.float64)
             sx_rows = []
             for i in range(self.n_patches):
                 sx_i = self.scatter.get_std_x(
                     observable1=obs_select, observable2=obs_select,
                     layer=0, lnM=ln_M_np, other_params={"zc": zc_grid_np,
-                                                        "patch": i})
+                                                        "patch": i,
+                                                        "h": float(self.cosmology.cosmo_params["h"])})
                 sx_i = jnp.asarray(sx_i, dtype=jnp.float64)
                 assert sx_i.shape == (n_zv, len(ln_M_np)), (
                     f"get_std_x must return (n_z, n_lnM); got {sx_i.shape}")
@@ -2567,20 +2582,22 @@ class cluster_number_counts:
             all_cut_val_sets = tuple(all_cut_val_sets)
             all_meancut_val_sets = tuple(all_meancut_val_sets)
 
-            # [mass-dep scatter 2026-08-29] Per-cluster layer-0 sigma(M, z)
-            # tables for the x-dep 1D backward conv: (n_bc, n_ref) per set,
-            # evaluated on the abundance log-M grid (the reference table the
-            # kernel interpolates onto each cluster's own mass grid). Only the
-            # selection observable's 1-obs set gets a real table; every other
-            # set gets a (n_bc, 1) dummy (its kernel ignores it at trace time).
+            # [mass-dep scatter 2026-08-29; generalised 2026-09-08] Per-cluster
+            # layer-0 sigma(M, z) tables for the x-dep 1D backward conv:
+            # (n_bc, n_ref) per set, evaluated on the abundance log-M grid (the
+            # reference table the kernel interpolates onto each cluster's own
+            # mass grid). Every 1-obs set whose observable declares x-dependent
+            # layer-0 scatter gets a real table; every other set gets a
+            # (n_bc, 1) dummy (its kernel ignores it at trace time).
             lnM_ref_sx = jnp.asarray(self.ln_M, dtype=jnp.float64)
             all_sigma_x = []
-            for obs_names in self._bc_set_obs:
-                if self._xdep_scatter_on and obs_names == [obs_select_key]:
+            for obs_names, _xdep_set in zip(self._bc_set_obs, self._bc_set_xdep):
+                if _xdep_set:
                     sx = self.scatter.get_std_x(
-                        observable1=obs_select_key, observable2=obs_select_key,
+                        observable1=obs_names[0], observable2=obs_names[0],
                         layer=0, lnM=np.asarray(self.ln_M, dtype=np.float64),
-                        other_params={"zc": self._bc_cached['z_np']})
+                        other_params={"zc": self._bc_cached['z_np'],
+                                      "h": float(self.cosmology.cosmo_params["h"])})
                     sx = jnp.asarray(sx, dtype=jnp.float64)
                     assert sx.shape == (n_bc, len(self.ln_M)), (
                         f"get_std_x must return (n_bc, n_lnM); got {sx.shape}")
