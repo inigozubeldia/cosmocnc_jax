@@ -1653,6 +1653,21 @@ class cluster_number_counts:
         self._jit_compute_abundance = _make_jit_abundance(abundance_vmap_pz)
 
         # ── 6. Cosmo interpolation JIT (all dynamic data as args) ──
+        # bc_hmf_z_interp selects how the HMF matrix is interpolated in redshift to each
+        # cluster's z for the per-cluster (backward-convolution) terms:
+        #   "linear" : linear in z between grid points (the original behaviour).
+        #   "log"    : the HMF matrix carries the comoving volume element dV/dz/dOmega
+        #              (~ z^2 at low z), which dominates the linear-interpolation error on
+        #              a coarse grid and makes it cosmology-dependent. Here ln(hmf * E/chi^2)
+        #              -- the mass function proper, smooth in z -- is interpolated linearly
+        #              and chi^2/E is rebuilt at the cluster's z from the interpolated D_A
+        #              and E_z (chi = D_A (1+z), nearly linear in z). Same cost; on a
+        #              50-point grid it reproduces a 400-point grid to ~0.1 in the summed
+        #              log-likelihood where the linear scheme is off by several units.
+        _hmf_z_interp = self.cnc_params.get("bc_hmf_z_interp", "linear")
+        if _hmf_z_interp not in ("linear", "log"):
+            raise ValueError(f"bc_hmf_z_interp must be 'linear' or 'log', got {_hmf_z_interp!r}")
+
         @jax.jit
         def _interp_cosmo_jit(z_obs, D_A, E_z, D_l_CMB, rho_c, hmf_ds,
                                z_min, z_max, n_z):
@@ -1660,7 +1675,15 @@ class cluster_number_counts:
             E_z_c = jax.vmap(lambda z: interp_uniform(z, z_min, z_max, n_z, E_z))(z_obs)
             D_l_CMB_c = jax.vmap(lambda z: interp_uniform(z, z_min, z_max, n_z, D_l_CMB))(z_obs)
             rho_c_c = jax.vmap(lambda z: interp_uniform(z, z_min, z_max, n_z, rho_c))(z_obs)
-            hmf_z_c = jax.vmap(lambda z: interp_along_axis0_uniform(z, z_min, z_max, n_z, hmf_ds))(z_obs)
+            if _hmf_z_interp == "log":
+                n_grid = D_A.shape[0]                       # static shape (n_z is a traced scalar)
+                z_grid = z_min + (z_max - z_min) * jnp.arange(n_grid) / (n_grid - 1)
+                vol_grid = (D_A * (1. + z_grid))**2 / E_z   # chi^2/E on the grid (constant factors drop out)
+                ln_f = jnp.log(jnp.maximum(hmf_ds / vol_grid[:, None], 1e-300))
+                vol_c = (D_A_c * (1. + z_obs))**2 / E_z_c
+                hmf_z_c = jnp.exp(jax.vmap(lambda z: interp_along_axis0_uniform(z, z_min, z_max, n_z, ln_f))(z_obs)) * vol_c[:, None]
+            else:
+                hmf_z_c = jax.vmap(lambda z: interp_along_axis0_uniform(z, z_min, z_max, n_z, hmf_ds))(z_obs)
             return D_A_c, E_z_c, D_l_CMB_c, rho_c_c, hmf_z_c
         self._interp_cosmo_jit = _interp_cosmo_jit
 

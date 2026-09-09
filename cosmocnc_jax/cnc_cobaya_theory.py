@@ -21,7 +21,7 @@ _CNC_PARAM_KEYS = (
     "number_cores_stacked", "parallelise_type",
     # precision
     "n_points", "n_obs_select", "n_z", "n_points_data_lik", "sigma_mass_prior",
-    "downsample_hmf_bc", "padding_fraction", "pad_abundance", "bc_chunk_size",
+    "downsample_hmf_bc", "bc_hmf_z_interp", "padding_fraction", "pad_abundance", "bc_chunk_size",
     "nd_convolution_mode",
     "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
     "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
@@ -95,6 +95,7 @@ _SR_INPUT_PARAMS = (
     "gamma_z_szifi", # [2026-08-18] z-running of sigma_lnq
     "sigma_lnq_m_szifi", # [2026-08-29] mass-running of sigma_lnq
     "dalpha_szifi",  # [2026-08-19] faint-end slope offset (broken power law)
+    "dbeta_szifi",   # low-redshift E(z)-exponent offset (broken redshift evolution)
     "q_cutoff",      # [2026-08-27] selection cutoff as a sampled nuisance; when not
                      # sampled, calculate() falls back to the cnc_params mirror
     "dof",           # [2026-08-27] same, for optional dof-marginalization variants
@@ -132,6 +133,7 @@ class cnc(classy):
     n_obs_select : Optional[str] =  2048*2 #Deprecated
     n_z : Optional[str] =  50
     downsample_hmf_bc: Optional[str] = 1
+    bc_hmf_z_interp: Optional[str] = "linear"   # per-cluster redshift interpolation of the HMF matrix: "linear" | "log" (see cnc._build_jit_functions)
 
     n_points_data_lik : Optional[str] =  128 #number of points for the computation of the cluster data part of the likelihood
     sigma_mass_prior : Optional[str] =  5.
@@ -501,6 +503,7 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"gamma_z_szifi")  # [2026-08-18]
         assign_parameter_value(scal_rel_params,params_values,"sigma_lnq_m_szifi")  # [2026-08-29]
         assign_parameter_value(scal_rel_params,params_values,"dalpha_szifi")   # [2026-08-19]
+        assign_parameter_value(scal_rel_params,params_values,"dbeta_szifi")    # broken redshift evolution
 
         # weak-lensing 10-parameter calibration (mass slopes + per-z-bin
         # bias/scatter amplitudes; joint Gaussian prior supplied by the analysis).
