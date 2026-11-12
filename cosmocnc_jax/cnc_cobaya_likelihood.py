@@ -107,6 +107,16 @@ class joint_gaussian_prior(Likelihood):
                 ["alpha", "alpha_sigma", "b0", "s0", "b1", "s1", "b2", "s2", "b3", "s3"],
             ("a_beta_generic", "alpha_beta_generic", "beta_beta_generic"):
                 ["a_beta", "alpha_beta", "beta_beta"],
+            # weak-lensing PCA-score calibration (mass slopes + 4 or 5 scores per profile;
+            # the npz `names` follow the calibration file's own naming)
+            ("b_wl_m", "s_wl_m", "b_wl_pc1", "b_wl_pc2", "b_wl_pc3", "b_wl_pc4",
+             "s_wl_pc1", "s_wl_pc2", "s_wl_pc3", "s_wl_pc4"):
+                ["p0", "p1", "bias_pc1", "bias_pc2", "bias_pc3", "bias_pc4",
+                 "scatter_pc1", "scatter_pc2", "scatter_pc3", "scatter_pc4"],
+            ("b_wl_m", "s_wl_m", "b_wl_pc1", "b_wl_pc2", "b_wl_pc3", "b_wl_pc4", "b_wl_pc5",
+             "s_wl_pc1", "s_wl_pc2", "s_wl_pc3", "s_wl_pc4", "s_wl_pc5"):
+                ["p0", "p1", "bias_pc1", "bias_pc2", "bias_pc3", "bias_pc4", "bias_pc5",
+                 "scatter_pc1", "scatter_pc2", "scatter_pc3", "scatter_pc4", "scatter_pc5"],
         }
         _base = os.path.basename(str(self.prior_file))
         _key = tuple(self._params)
