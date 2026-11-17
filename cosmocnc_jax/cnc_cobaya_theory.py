@@ -156,6 +156,10 @@ class cnc(classy):
 
     survey_sr : Optional[str] =  "none"
     survey_cat: Optional[str] =  "none"
+    # Names of additional scaling-relation parameters, supplied by the run configuration,
+    # to route from the sampler into scal_rel_params (for survey files whose parameters
+    # are not in the built-in list). Each is passed through unchanged if present in the run.
+    extra_scal_rel_params : Optional[list] = None
     number_cores_hmf : Optional[str] = 8
     number_cores_abundance : Optional[str] = 8
     number_cores_data : Optional[str] = 8
@@ -475,7 +479,8 @@ class cnc(classy):
         # likelihood for entire MCMC campaigns).
         return list(dict.fromkeys(
             list(super().get_can_support_params())
-            + list(_COSMO_INPUT_PARAMS) + list(_SR_INPUT_PARAMS)))
+            + list(_COSMO_INPUT_PARAMS) + list(_SR_INPUT_PARAMS)
+            + list(self.extra_scal_rel_params or [])))
 
     def must_provide(self, **requirements):
 
@@ -574,6 +579,10 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"alpha_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"beta_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"cmblensing_bias_simple")
+
+        # additional scaling-relation parameters named by the run configuration
+        for _extra in (self.extra_scal_rel_params or []):
+            assign_parameter_value(scal_rel_params,params_values,_extra)
 
         # SPT-style parameters:
 
