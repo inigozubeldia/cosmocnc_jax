@@ -40,6 +40,8 @@ cnc_params_default = {
     # observable must be 2-layer and sit in a 1-observable correlation set.
     "mass_dep_scatter": False,
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
+    "bc_sparse_sets": False,  # evaluate the backward convolution of a 1-observable correlation set only for the clusters
+                              # that have that observable (the others never use its result); same values
     "bc_cluster_threads": 1,  # CPU: number of groups of clusters whose backward-convolution term is computed concurrently
                               # on separate threads (same compiled kernel per cluster; 1 = as before)
     "parallel_abundance_and_data": False,  # CPU: evaluate the abundance and the cluster data term concurrently (they share

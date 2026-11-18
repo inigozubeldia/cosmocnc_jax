@@ -21,7 +21,7 @@ _CNC_PARAM_KEYS = (
     "number_cores_stacked", "parallelise_type",
     # precision
     "n_points", "n_obs_select", "n_z", "n_points_data_lik", "sigma_mass_prior",
-    "downsample_hmf_bc", "bc_hmf_z_interp", "padding_fraction", "pad_abundance", "bc_chunk_size", "abundance_patch_threads", "bc_cluster_threads", "parallel_abundance_and_data",
+    "downsample_hmf_bc", "bc_hmf_z_interp", "padding_fraction", "pad_abundance", "bc_chunk_size", "abundance_patch_threads", "bc_cluster_threads", "parallel_abundance_and_data", "bc_sparse_sets",
     "nd_convolution_mode",
     "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
     "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
@@ -289,6 +289,7 @@ class cnc(classy):
     bc_chunk_size: Optional[int] = 2000
     abundance_patch_threads: Optional[int] = 1
     bc_cluster_threads: Optional[int] = 1
+    bc_sparse_sets: Optional[bool] = False
     parallel_abundance_and_data: Optional[bool] = False
     nd_convolution_mode: Optional[str] = "linear"
     load_catalogue: Optional[bool] = True

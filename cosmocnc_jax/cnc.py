@@ -1485,6 +1485,58 @@ class cluster_number_counts:
                 _1layer_n_pc_l0.append(0)
         n_1layer = len(self._1layer_obs_list)
 
+        # ── 4c-bis. Sparse 1-observable sets (bc_sparse_sets, default off) ──
+        # A cluster without the observable of a 1-observable set never uses that set's
+        # backward convolution (its factor is replaced by 1 in the all-in-one kernel). With
+        # bc_sparse_sets the convolution of such a set is evaluated only for the clusters that
+        # have the observable, by the function below (the same steps as the inline 1D branch
+        # of the all-in-one kernel), and handed to the all-in-one kernel through the
+        # pre-computed-cpdf input that the 2D+ sets already use.
+        def _make_sparse_1d_set(bc_fn, pref_fn, n_pts):
+            def per_cluster_set(mn, mx, obs_val,
+                                E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                                H0, D_CMB, gamma, z_c,
+                                pref_sr, layer0_sr, layer1_sr,
+                                layer0_sr_pc, layer1_sr_pc,
+                                cov_layer0, cov_layer1,
+                                apply_cut, cut_val, mean_cut_val,
+                                patch_idx, sigma_x_row, lnM_ref_sx):
+                lnM = jnp.linspace(mn, mx, n_pts)
+                psr = tuple(p[patch_idx] for p in pref_sr)
+                l0 = tuple(p[patch_idx] for p in layer0_sr)
+                l1 = tuple(p[patch_idx] for p in layer1_sr)
+                prefactors = pref_fn(E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                                     H0, D_CMB, gamma, z_c, *psr)
+                return bc_fn(
+                    lnM, jnp.array([obs_val]),
+                    (prefactors + l0 + layer0_sr_pc,), (prefactors + l1 + layer1_sr_pc,),
+                    cov_layer0, cov_layer1,
+                    n_pts, apply_cut, cut_val, mean_cut_val,
+                    sigma_x_row=sigma_x_row, lnM_ref=lnM_ref_sx)
+            vmap_in = (0, 0, 0,
+                       0, 0, 0, 0,
+                       None, None, None, 0,
+                       None, None, None,
+                       0, 0,
+                       0, 0,
+                       None, None, None,
+                       0, 0, None)
+            return jax.jit(jax.vmap(per_cluster_set, in_axes=vmap_in))
+
+        self._sparse_1d_set_jits = {}   # s_idx -> (jit, index of the observable in _bc_obs_list)
+        if bool(self.cnc_params.get("bc_sparse_sets", False)) and self.catalogue is not None:
+            for s_idx, obs_names in enumerate(self._bc_set_obs):
+                if len(obs_names) != 1 or obs_names[0] not in self.catalogue.catalogue:
+                    continue
+                _vals = np.asarray(self.catalogue.catalogue[obs_names[0]], dtype=np.float64)
+                if not np.any(np.isnan(_vals)):
+                    continue   # every cluster has it: nothing to skip
+                _i_flat = self._bc_obs_list.index(obs_names[0])
+                self._sparse_1d_set_jits[s_idx] = (
+                    _make_sparse_1d_set(set_bc_fns[s_idx], flat_pref_fn_list[_i_flat], n_points_dl),
+                    _i_flat)
+                s_is_nd[s_idx] = True   # the all-in-one kernel then reads this set's cpdf from its input
+
         self._allinone_bc_jit, self._allinone_bc_per_cluster = _make_allinone_bc(
             set_bc_fns, set_pref_fns, set_n_psr, set_sizes, set_obs_indices,
             flat_pref_fn_list, flat_n_psr_list, n_points_dl,
@@ -2850,8 +2902,39 @@ class cluster_number_counts:
                     n_obs_s = len(obs_names_s)
 
                     if n_obs_s < 2:
-                        # 1D set: dummy (computed inline by all-in-one JIT)
-                        pre_nd_list.append(jnp.zeros((n_cl, n_points_dl)))
+                        _sp = self._sparse_1d_set_jits.get(s_idx)
+                        if _sp is None:
+                            # 1D set: dummy (computed inline by all-in-one JIT)
+                            pre_nd_list.append(jnp.zeros((n_cl, n_points_dl)))
+                            continue
+                        # sparse 1-observable set: only the clusters that have the observable
+                        _sp_jit, _i_flat = _sp
+                        _key = ('sparse_idx', s_idx)
+                        if _key not in self._bc_cached:
+                            self._bc_cached[_key] = np.where(np.asarray(all_has_obs[_i_flat]))[0]
+                        ci_global = self._bc_cached[_key]
+                        if sl is not None:
+                            ci_g = ci_global[(ci_global >= sl.start) & (ci_global < sl.stop)]
+                            ci_l = ci_g - sl.start
+                        else:
+                            ci_g = ci_global
+                            ci_l = ci_global
+                        cpdf_set = jnp.zeros((n_cl, n_points_dl))
+                        if len(ci_g) > 0:
+                            ci = jnp.array(ci_g)
+                            cpdf_sub = _sp_jit(
+                                lnM_min[ci], lnM_max[ci], all_obs_vals[_i_flat][ci],
+                                E_z_c[ci], D_A_c[ci], D_l_CMB_c[ci], rho_c_c[ci],
+                                H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters[ci],
+                                all_pref_sr[_i_flat], all_layer0_sr[_i_flat], all_layer1_sr[_i_flat],
+                                tuple(p[ci] for p in all_layer0_sr_pc[_i_flat]),
+                                tuple(p[ci] for p in all_layer1_sr_pc[_i_flat]),
+                                all_cov_layer0[s_idx][ci], all_cov_layer1[s_idx][ci],
+                                all_apply_cut_sets[s_idx], all_cut_val_sets[s_idx],
+                                all_meancut_val_sets[s_idx],
+                                patch_clusters[ci], all_sigma_x[s_idx][ci], lnM_ref_sx)
+                            cpdf_set = cpdf_set.at[jnp.array(ci_l)].set(cpdf_sub)
+                        pre_nd_list.append(cpdf_set)
                         continue
 
                     # 2D+ set: pattern-aware dispatch
