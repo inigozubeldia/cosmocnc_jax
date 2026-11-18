@@ -2737,6 +2737,15 @@ class cluster_number_counts:
 
             bc_chunk = int(self.cnc_params.get("bc_chunk_size", 0))
             n_points_dl = int(self.cnc_params["n_points_data_lik"])
+            # bc_cluster_threads = K > 1: the clusters go through the chunked path below in K
+            # (or more, if bc_chunk_size is smaller) chunks, and the chunks run on concurrent
+            # threads instead of one after the other. Same kernel per cluster.
+            bc_threads = int(self.cnc_params.get("bc_cluster_threads", 1))
+            if is_traced(self.hmf_matrix):
+                bc_threads = 1
+            if bc_threads > 1 and n_bc > 1:
+                _per_thread = -(-n_bc // bc_threads)
+                bc_chunk = _per_thread if bc_chunk <= 0 else min(bc_chunk, _per_thread)
 
             # Shared (non-per-cluster) args for all-in-one
             shared_args = (all_pref_sr, all_layer0_sr, all_layer1_sr,
@@ -2968,10 +2977,7 @@ class cluster_number_counts:
                     all_sigma_x, lnM_ref_sx)
             else:
                 # Chunked: process bc_chunk clusters at a time
-                log_liks_list = []
-                cpdf_list = []
-                lnM_list = []
-                for c_start in range(0, n_bc, bc_chunk):
+                def _one_chunk(c_start):
                     c_end = min(c_start + bc_chunk, n_bc)
                     sl = slice(c_start, c_end)
                     pre_nd_chunk = _compute_all_set_cpdfs(sl)
@@ -3003,12 +3009,22 @@ class cluster_number_counts:
                         pref_sr_1l, l0_sr_1l, l0_pc_1l_sl, cov_1l,
                         pre_nd_chunk,
                         tuple(s[sl] for s in all_sigma_x), lnM_ref_sx)
-                    log_liks_list.append(ll)
-                    cpdf_list.append(cw)
-                    lnM_list.append(lm)
-                log_liks = jnp.concatenate(log_liks_list)
-                cpdf_with_hmf = jnp.concatenate(cpdf_list)
-                lnM_grid = jnp.concatenate(lnM_list)
+                    if bc_threads > 1:
+                        ll.block_until_ready()
+                    return ll, cw, lm
+
+                _starts = list(range(0, n_bc, bc_chunk))
+                if bc_threads > 1 and len(_starts) > 1:
+                    if getattr(self, "_bc_pool_size", None) != bc_threads:
+                        from concurrent.futures import ThreadPoolExecutor
+                        self._bc_pool = ThreadPoolExecutor(max_workers=bc_threads)
+                        self._bc_pool_size = bc_threads
+                    _chunks = list(self._bc_pool.map(_one_chunk, _starts))
+                else:
+                    _chunks = [_one_chunk(c) for c in _starts]
+                log_liks = jnp.concatenate([c[0] for c in _chunks])
+                cpdf_with_hmf = jnp.concatenate([c[1] for c in _chunks])
+                lnM_grid = jnp.concatenate([c[2] for c in _chunks])
 
             log_lik_data_rank = jnp.sum(log_liks)
 
@@ -3571,6 +3587,23 @@ class cluster_number_counts:
 
         self.time_hmf = t1-t0
 
+        # parallel_abundance_and_data: the abundance and the cluster data term share only the
+        # mass function, so the data term can run on its own thread while the abundance is
+        # computed. Only when the data term does not read the abundance (no cluster without
+        # redshift, data term not taken from the abundance), outside a trace, and after a
+        # first ordinary evaluation has set the attributes the data term reads.
+        _data_future = None
+        if (self.n_tot is None and bool(self.cnc_params.get("parallel_abundance_and_data", False))
+                and not is_traced(self.hmf_matrix)
+                and self.cnc_params["data_lik_from_abundance"] == False
+                and len(self.catalogue.indices_no_z) == 0
+                and self.cnc_params["non_validated_clusters"] == False
+                and hasattr(self, "_bc_cached") and hasattr(self, "n_patches")):
+            if not hasattr(self, "_stage_pool"):
+                from concurrent.futures import ThreadPoolExecutor
+                self._stage_pool = ThreadPoolExecutor(max_workers=1)
+            _data_future = self._stage_pool.submit(self.get_log_lik_data)
+
         if self.n_tot is None:
 
             self.get_number_counts()
@@ -3597,7 +3630,7 @@ class cluster_number_counts:
 
         #Cluster data term
 
-        log_lik = log_lik + self.get_log_lik_data()
+        log_lik = log_lik + (_data_future.result() if _data_future is not None else self.get_log_lik_data())
 
         self.t_data = time.time()-t2
 
