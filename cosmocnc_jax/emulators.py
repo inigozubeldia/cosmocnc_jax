@@ -221,3 +221,64 @@ def make_sigma8_function(der_emulator, lnAs_index):
         return _call_emulator(der_emulator, vec)[1]
 
     return sigma8_of_lnAs
+
+
+def make_sigma8_solver_checked(der_emulator, lnAs_index, lnAs_min, lnAs_max,
+                               lnAs_default, sigma8_rtol, n_newton=8, n_bisect=60):
+    """Traceable sigma8 -> lnAs solve with the same safeguards as the Python-level one.
+
+    Newton iteration (the same step as make_sigma8_solver) from a fixed starting value; the
+    solution is accepted if it is finite, inside [lnAs_min, lnAs_max] and reproduces the
+    target to sigma8_rtol; otherwise the root is bracketed and bisected inside the range.
+
+    Returns:
+        solve: (cosmo_vec_der, sigma8_target) -> (lnAs, ok); ok is False when the target
+            cannot be reached inside the range (lnAs is then not meaningful).
+    """
+    def sigma8_from_lnAs(cosmo_vec_der, lnAs):
+        vec = cosmo_vec_der.at[lnAs_index].set(lnAs)
+        return _call_emulator(der_emulator, vec)[1]
+
+    grad_sigma8 = jax.grad(sigma8_from_lnAs, argnums=1)
+
+    def solve(cosmo_vec_der, sigma8_target):
+        sigma8_target = jnp.asarray(sigma8_target, dtype=jnp.float64)
+
+        def accepted(lnAs):
+            s8 = sigma8_from_lnAs(cosmo_vec_der, lnAs)
+            return (jnp.isfinite(lnAs) & (lnAs >= lnAs_min) & (lnAs <= lnAs_max)
+                    & jnp.isfinite(s8)
+                    & (jnp.abs(s8 - sigma8_target) <= sigma8_rtol * jnp.abs(sigma8_target)))
+
+        def newton_body(_, lnAs):
+            s8 = sigma8_from_lnAs(cosmo_vec_der, lnAs)
+            ds8 = grad_sigma8(cosmo_vec_der, lnAs)
+            return lnAs - (s8 - sigma8_target) / ds8
+
+        lnAs_newton = jax.lax.fori_loop(0, n_newton, newton_body,
+                                        jnp.asarray(lnAs_default, dtype=jnp.float64))
+        ok_newton = accepted(lnAs_newton)
+
+        def bisect(_):
+            lo0 = jnp.asarray(lnAs_min, dtype=jnp.float64)
+            hi0 = jnp.asarray(lnAs_max, dtype=jnp.float64)
+            s_lo = sigma8_from_lnAs(cosmo_vec_der, lo0)
+            s_hi = sigma8_from_lnAs(cosmo_vec_der, hi0)
+            reachable = (jnp.isfinite(s_lo) & jnp.isfinite(s_hi)
+                         & (s_lo < sigma8_target) & (sigma8_target < s_hi))
+
+            def body(_, lohi):
+                lo, hi = lohi
+                mid = 0.5 * (lo + hi)
+                below = sigma8_from_lnAs(cosmo_vec_der, mid) < sigma8_target
+                return jnp.where(below, mid, lo), jnp.where(below, hi, mid)
+
+            lo, hi = jax.lax.fori_loop(0, n_bisect, body, (lo0, hi0))
+            lnAs_b = 0.5 * (lo + hi)
+            return lnAs_b, reachable & accepted(lnAs_b)
+
+        return jax.lax.cond(ok_newton,
+                            lambda _: (lnAs_newton, jnp.asarray(True)),
+                            bisect, None)
+
+    return solve

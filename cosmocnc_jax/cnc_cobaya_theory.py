@@ -21,7 +21,7 @@ _CNC_PARAM_KEYS = (
     "number_cores_stacked", "parallelise_type",
     # precision
     "n_points", "n_obs_select", "n_z", "n_points_data_lik", "sigma_mass_prior",
-    "downsample_hmf_bc", "bc_hmf_z_interp", "padding_fraction", "pad_abundance", "bc_chunk_size",
+    "downsample_hmf_bc", "bc_hmf_z_interp", "padding_fraction", "pad_abundance", "bc_chunk_size", "abundance_patch_threads",
     "nd_convolution_mode",
     "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
     "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
@@ -287,6 +287,7 @@ class cnc(classy):
     # [mass-dep scatter 2026-08-29] gated layer-0 sigma(M, z) via explicit quadrature (default OFF)
     mass_dep_scatter: Optional[bool] = False
     bc_chunk_size: Optional[int] = 2000
+    abundance_patch_threads: Optional[int] = 1
     nd_convolution_mode: Optional[str] = "linear"
     load_catalogue: Optional[bool] = True
     precompute_cnc_quantities_catalogue: Optional[bool] = True
@@ -443,7 +444,7 @@ class cnc(classy):
             self.cnc.cnc_params[_key] = getattr(self, _key)
         # restore int/float types for the shape/size params
         for _key in ("n_points", "n_obs_select", "n_z", "downsample_hmf_bc",
-                     "n_points_data_lik", "bc_chunk_size", "n_z_error_integral",
+                     "n_points_data_lik", "bc_chunk_size", "abundance_patch_threads", "n_z_error_integral",
                      "obs_select_conv_chunk"):
             self.cnc.cnc_params[_key] = int(self.cnc.cnc_params[_key])
         for _key in ("M_min", "M_max", "camb_accuracy_boost"):

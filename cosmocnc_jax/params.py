@@ -40,6 +40,8 @@ cnc_params_default = {
     # observable must be 2-layer and sit in a 1-observable correlation set.
     "mass_dep_scatter": False,
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
+    "abundance_patch_threads": 1,  # CPU: number of groups of selection patches whose abundance is computed concurrently
+                                   # on separate threads (same compiled kernel per patch; 1 = one call, as before)
 
     # nd_convolution_mode: Convolution mode for N-D (2D+) backward convolution.
     #   "circular": Circular FFT convolution — ~4x faster (90ms vs 420ms at npts=128

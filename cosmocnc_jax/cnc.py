@@ -10,6 +10,8 @@ from .sr import *
 from .cat import *
 from .params import *
 from .utils import *
+from .tracing import is_traced, to_float
+import logging
 import time
 import importlib.util
 import sys
@@ -1652,6 +1654,26 @@ class cluster_number_counts:
             return compute
         self._jit_compute_abundance = _make_jit_abundance(abundance_vmap_pz)
 
+        # The same computation split in two compiled functions, used when the abundance is
+        # evaluated over groups of patches on concurrent threads (abundance_patch_threads > 1):
+        # the tensor for a group of patches (the same vmapped kernel), and the integrals of
+        # the assembled tensor (the same expressions as in compute above).
+        self._jit_abundance_tensor = jax.jit(abundance_vmap_pz)
+
+        @jax.jit
+        def _abundance_integrals(abundance_tensor, hmf_matrix, ln_M, obs_select_vec,
+                                 redshift_vec, total_skyfrac):
+            n_obs_matrix = simpson(abundance_tensor, x=redshift_vec, axis=1)
+            n_tot_vec = simpson(n_obs_matrix, x=obs_select_vec, axis=-1)
+            abundance_matrix = jnp.sum(abundance_tensor, axis=0)
+            n_z_vec = simpson(abundance_matrix, x=obs_select_vec)
+            n_tot = jnp.sum(n_tot_vec)
+            dndz_hmf = simpson(hmf_matrix * 4. * jnp.pi * total_skyfrac, x=ln_M, axis=1)
+            n_tot_hmf = simpson(dndz_hmf, x=redshift_vec)
+            return (abundance_tensor, n_obs_matrix, n_tot_vec,
+                    abundance_matrix, n_z_vec, n_tot, dndz_hmf, n_tot_hmf)
+        self._jit_abundance_integrals = _abundance_integrals
+
         # ── 6. Cosmo interpolation JIT (all dynamic data as args) ──
         # bc_hmf_z_interp selects how the HMF matrix is interpolated in redshift to each
         # cluster's z for the per-cluster (backward-convolution) terms:
@@ -2107,7 +2129,7 @@ class cluster_number_counts:
             if do_cutoff and hasattr(sr_sel, 'get_cutoff'):
                 cv = sr_sel.get_cutoff(layer=k)
                 all_cutoff_vals_list.append(jnp.float64(cv))
-                all_apply_cutoffs_list.append(jnp.bool_(cv > -1e30))
+                all_apply_cutoffs_list.append(jnp.asarray(cv > -1e30) if is_traced(cv) else jnp.bool_(cv > -1e30))
             else:
                 all_cutoff_vals_list.append(jnp.float64(-jnp.inf))
                 all_apply_cutoffs_list.append(jnp.bool_(False))
@@ -2152,7 +2174,7 @@ class cluster_number_counts:
                     observable1=obs_select, observable2=obs_select,
                     layer=0, lnM=ln_M_np, other_params={"zc": zc_grid_np,
                                                         "patch": i,
-                                                        "h": float(self.cosmology.cosmo_params["h"])})
+                                                        "h": to_float(self.cosmology.cosmo_params["h"])})
                 sx_i = jnp.asarray(sx_i, dtype=jnp.float64)
                 assert sx_i.shape == (n_zv, len(ln_M_np)), (
                     f"get_std_x must return (n_z, n_lnM); got {sx_i.shape}")
@@ -2161,14 +2183,54 @@ class cluster_number_counts:
         else:
             sigma_x_l0 = jnp.zeros((self.n_patches, n_zv, 1), dtype=jnp.float64)
 
-        (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
-         abundance_matrix_out, n_z_vec_out, n_tot_out,
-         self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
-            self.hmf_matrix, self.ln_M, self.obs_select_vec, self.redshift_vec,
-            all_layer_args_patched, all_deriv_args_patched,
-            all_scatters, all_cutoff_vals, all_apply_cutoffs,
-            sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac,
-            sigma_x_l0)
+        n_groups = min(int(self.cnc_params.get("abundance_patch_threads", 1)), self.n_patches)
+        if is_traced(self.hmf_matrix):
+            n_groups = 1   # inside a whole-evaluation trace: one call (threads are a host-level construct)
+
+        if n_groups <= 1:
+
+            (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
+             abundance_matrix_out, n_z_vec_out, n_tot_out,
+             self.dndz_hmf, self.n_tot_hmf) = self._jit_compute_abundance(
+                self.hmf_matrix, self.ln_M, self.obs_select_vec, self.redshift_vec,
+                all_layer_args_patched, all_deriv_args_patched,
+                all_scatters, all_cutoff_vals, all_apply_cutoffs,
+                sigma_scatter_min, skyfracs_arr, pad_abundance, total_skyfrac,
+                sigma_x_l0)
+
+        else:
+
+            # Groups of consecutive patches, each evaluated by the same compiled kernel on its
+            # own thread (compiled code releases the interpreter lock, and on CPU most of the
+            # kernel -- the FFTs -- runs on the calling thread). Every per-patch argument
+            # carries the patch axis first, so a group is a slice of that axis.
+            if getattr(self, "_abundance_pool_size", None) != n_groups:
+                from concurrent.futures import ThreadPoolExecutor
+                self._abundance_pool = ThreadPoolExecutor(max_workers=n_groups)
+                self._abundance_pool_size = n_groups
+                edges = np.linspace(0, self.n_patches, n_groups + 1).round().astype(int)
+                self._abundance_groups = [slice(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+
+            per_patch = (all_layer_args_patched, all_deriv_args_patched,
+                         all_scatters, skyfracs_arr, sigma_x_l0)
+
+            def _one_group(sl):
+                la, da, sc, sf, sx = jax.tree_util.tree_map(lambda a: a[sl], per_patch)
+                out = self._jit_abundance_tensor(
+                    self.hmf_matrix, self.ln_M, self.obs_select_vec,
+                    la, da, sc, all_cutoff_vals, all_apply_cutoffs,
+                    sigma_scatter_min, sf, pad_abundance, sx)
+                out.block_until_ready()
+                return out
+
+            tensor = jnp.concatenate(
+                list(self._abundance_pool.map(_one_group, self._abundance_groups)), axis=0)
+
+            (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
+             abundance_matrix_out, n_z_vec_out, n_tot_out,
+             self.dndz_hmf, self.n_tot_hmf) = self._jit_abundance_integrals(
+                tensor, self.hmf_matrix, self.ln_M, self.obs_select_vec,
+                self.redshift_vec, total_skyfrac)
 
         if self.cnc_params["compute_abundance_matrix"] == True:
             self.abundance_matrix = abundance_matrix_out
@@ -2572,22 +2634,40 @@ class cluster_number_counts:
             # numpy array; classes that don't ignore it.
             cov_other_params = {"zc": self._bc_cached['z_np']}
 
+            # traced scaling-relation parameters (whole-evaluation trace): the same entries
+            # assembled with jax.numpy (a NumPy array cannot hold traced values)
+            _cov_traced = is_traced(*self.scal_rel_params.values())
+
             for obs_names in self._bc_set_obs:
                 n_obs_s = len(obs_names)
-                cov_l0_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
-                cov_l1_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
-                for i in range(n_obs_s):
-                    for j in range(n_obs_s):
-                        cov_l0_np[:, i, j] = self.scatter.get_cov(
-                            observable1=obs_names[i], observable2=obs_names[j],
-                            layer=0, patch1=0, patch2=0,
+                if _cov_traced:
+                    def _cov_entry(i, j, layer, _names=obs_names):
+                        c = self.scatter.get_cov(
+                            observable1=_names[i], observable2=_names[j],
+                            layer=layer, patch1=0, patch2=0,
                             other_params=cov_other_params)
-                        cov_l1_np[:, i, j] = self.scatter.get_cov(
-                            observable1=obs_names[i], observable2=obs_names[j],
-                            layer=1, patch1=0, patch2=0,
-                            other_params=cov_other_params)
-                all_cov_layer0.append(jnp.asarray(cov_l0_np))
-                all_cov_layer1.append(jnp.asarray(cov_l1_np))
+                        return jnp.broadcast_to(jnp.asarray(c, dtype=jnp.float64), (n_bc,))
+                    all_cov_layer0.append(jnp.stack(
+                        [jnp.stack([_cov_entry(i, j, 0) for j in range(n_obs_s)], axis=-1)
+                         for i in range(n_obs_s)], axis=-2))
+                    all_cov_layer1.append(jnp.stack(
+                        [jnp.stack([_cov_entry(i, j, 1) for j in range(n_obs_s)], axis=-1)
+                         for i in range(n_obs_s)], axis=-2))
+                else:
+                    cov_l0_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
+                    cov_l1_np = np.zeros((n_bc, n_obs_s, n_obs_s), dtype=np.float64)
+                    for i in range(n_obs_s):
+                        for j in range(n_obs_s):
+                            cov_l0_np[:, i, j] = self.scatter.get_cov(
+                                observable1=obs_names[i], observable2=obs_names[j],
+                                layer=0, patch1=0, patch2=0,
+                                other_params=cov_other_params)
+                            cov_l1_np[:, i, j] = self.scatter.get_cov(
+                                observable1=obs_names[i], observable2=obs_names[j],
+                                layer=1, patch1=0, patch2=0,
+                                other_params=cov_other_params)
+                    all_cov_layer0.append(jnp.asarray(cov_l0_np))
+                    all_cov_layer1.append(jnp.asarray(cov_l1_np))
 
                 # Cutoff: applied if selection observable is in this set
                 set_has_cutoff = obs_select_key in obs_names
@@ -2620,7 +2700,7 @@ class cluster_number_counts:
                         observable1=obs_names[0], observable2=obs_names[0],
                         layer=0, lnM=np.asarray(self.ln_M, dtype=np.float64),
                         other_params={"zc": self._bc_cached['z_np'],
-                                      "h": float(self.cosmology.cosmo_params["h"])})
+                                      "h": to_float(self.cosmology.cosmo_params["h"])})
                     sx = jnp.asarray(sx, dtype=jnp.float64)
                     assert sx.shape == (n_bc, len(self.ln_M)), (
                         f"get_std_x must return (n_bc, n_lnM); got {sx.shape}")
@@ -3349,6 +3429,106 @@ class cluster_number_counts:
         self.log_lik = log_lik
 
         return log_lik
+
+    # ------------------------------------------------------------------------------------
+    # Whole-evaluation compiled function: parameter vector -> log-likelihood (+ derived).
+    # The ordinary driver (update_params + get_log_lik) is run ONCE under a JAX trace with
+    # the sampled parameters as traced values; every step it takes is recorded and compiled
+    # into a single function, which is differentiable and can be vmapped over parameter
+    # points. The driver mutates the state of this object, of the cosmology and of the
+    # scaling relations while it runs, so that state is saved before the trace and put back
+    # after it: the ordinary evaluation path is unaffected and stays usable alongside.
+    # ------------------------------------------------------------------------------------
+
+    _COMPILED_COSMO_NAMES = ("Om0", "Ob0", "h", "sigma_8", "A_s", "n_s", "m_nu", "Onu0", "w0",
+                             "tau_reio", "Ob0h2", "Oc0h2", "Onu0h2")
+
+    def _compiled_state_objects(self):
+        return [self, self.cosmology] + list(self.scaling_relations.values())
+
+    def _compiled_state_save(self):
+        from . import cosmo as _cosmo_mod
+        saved = []
+        for o in self._compiled_state_objects():
+            attrs = dict(vars(o))
+            dicts = [(v, dict(v)) for v in attrs.values() if isinstance(v, dict)]
+            saved.append((o, attrs, dicts))
+        return {"objects": saved,
+                "H0_class_value": _cosmo_mod.classy_sz_jax_cosmo.H0.value,
+                "logging_disable": logging.root.manager.disable}
+
+    def _compiled_state_restore(self, state):
+        from . import cosmo as _cosmo_mod
+        for o, attrs, dicts in state["objects"]:
+            vars(o).clear()
+            vars(o).update(attrs)
+            for d, content in dicts:
+                d.clear()
+                d.update(content)
+        _cosmo_mod.classy_sz_jax_cosmo.H0.value = state["H0_class_value"]
+        logging.disable(state["logging_disable"])
+
+    def build_compiled_log_lik(self, param_names, batched=False):
+        """Return f(theta) -> dict(log_lik, theta_mc, Om0, sigma_8, A_s, n_tot), one compiled
+        function for the whole evaluation.
+
+        param_names: names of the entries of theta, in order; cosmological names as in
+            cosmo_params ("H0" is accepted and sets h = H0/100), any other name is a
+            scaling-relation parameter. Every parameter NOT named keeps the value it has in
+            self.cosmo_params / self.scal_rel_params when this method is called.
+        batched: if True the function takes theta of shape (n_points, n_params) and
+            evaluates the points together (jax.vmap of the same trace).
+
+        A sigma_8 that cannot be reached by the sigma_8 -> A_s solve gives log_lik = -inf.
+        Only cosmology_tool = "classy_sz_jax" and the unbinned likelihood are supported.
+        """
+        if self.cnc_params["cosmology_tool"] != "classy_sz_jax":
+            raise NotImplementedError("build_compiled_log_lik requires cosmology_tool = 'classy_sz_jax'")
+        if self.cnc_params["likelihood_type"] != "unbinned":
+            raise NotImplementedError("build_compiled_log_lik supports likelihood_type = 'unbinned' only")
+        names = tuple(param_names)
+        # catalogue-side caches and the FFTLog objects are built by the first ordinary
+        # evaluation; make sure they exist as concrete arrays before tracing
+        if (not hasattr(self, "_bc_cached")) or (not hasattr(self, "_tv0")):
+            self.update_params(self.cosmo_params, self.scal_rel_params)
+            self.get_log_lik()
+        base_cosmo = dict(self.cosmo_params)
+        base_sr = dict(self.scal_rel_params)
+        pending = []   # state saved by a trace in progress, restored by the caller below
+
+        def pure(theta):
+            pending.append(self._compiled_state_save())
+            logging.disable(logging.CRITICAL)   # log calls format values; traced values cannot be formatted
+            cp = dict(base_cosmo)
+            sp = dict(base_sr)
+            for i, name in enumerate(names):
+                if name == "H0":
+                    cp["h"] = theta[i] / 100.
+                elif name in self._COMPILED_COSMO_NAMES:
+                    cp[name] = theta[i]
+                else:
+                    sp[name] = theta[i]
+            self.update_params(cp, sp)
+            log_lik = self.get_log_lik()
+            ok = getattr(self.cosmology, "_lnAs_ok", True)
+            out = {"log_lik": jnp.where(ok, log_lik, -jnp.inf),
+                   "theta_mc": self.cosmology.get_theta_mc(),
+                   "Om0": cp["Om0"], "sigma_8": cp["sigma_8"], "A_s": cp["A_s"],
+                   "n_tot": self.n_tot}
+            return {k: jnp.asarray(v, dtype=jnp.float64) for k, v in out.items()}
+
+        compiled = jax.jit(jax.vmap(pure) if batched else pure)
+
+        def f(theta):
+            theta = jnp.asarray(theta, dtype=jnp.float64)
+            try:
+                return compiled(theta)
+            finally:
+                while pending:
+                    self._compiled_state_restore(pending.pop())
+
+        f.param_names = names
+        return f
 
     #Computes the unbinned log likelihood
 

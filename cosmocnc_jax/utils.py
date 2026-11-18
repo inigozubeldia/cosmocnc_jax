@@ -26,6 +26,70 @@ def set_fft_c64(flag):
 
 
 # ---------------------------------------------------------------------------
+# Search-free interpolation that reproduces jnp.interp BIT FOR BIT (default path).
+# jnp.interp locates each query point with a sorted search (jnp.searchsorted), which on CPU
+# is the most expensive single operation of the abundance kernel and runs on one core. When
+# the target grid is uniform (layer resample) or the source grid is uniform (final
+# interpolation, small tables) the index the search returns can be obtained by arithmetic:
+#   - uniform TARGET, sorted source: #{j : xp[j] <= x_i} = cumulative sum of a histogram of
+#     the analytic source positions ceil((xp - x_min)/dx);
+#   - uniform SOURCE: floor((x - x0[0])/dx) + 1.
+# Either estimate can be off by one where a query coincides with a source point to rounding,
+# so it is corrected with the very comparisons the sorted search makes (xp[i-1] <= x < xp[i]),
+# after which the index equals searchsorted(xp, x, side='right') and jnp.interp's own formula
+# is applied unchanged. Requires xp sorted (as jnp.interp does).
+# set_exact_search_free_interp(False) restores the jnp.interp calls.
+# ---------------------------------------------------------------------------
+_EXACT_SEARCH_FREE = True
+
+
+def set_exact_search_free_interp(flag):
+    """Enable (True, default) the search-free evaluation of the default-path interpolations
+    (bit-identical to jnp.interp), or call jnp.interp itself (False). Read at trace time."""
+    global _EXACT_SEARCH_FREE
+    _EXACT_SEARCH_FREE = bool(flag)
+
+
+def _interp_formula(x, xp, fp, i, left, right):
+    """The arithmetic of jnp.interp given the bracketing index i (xp[i-1] <= x < xp[i])."""
+    df = fp[i] - fp[i - 1]
+    dx = xp[i] - xp[i - 1]
+    delta = x - xp[i - 1]
+    epsilon = np.spacing(np.finfo(xp.dtype).eps)
+    dx0 = jnp.abs(dx) <= epsilon
+    f = jnp.where(dx0, fp[i - 1], fp[i - 1] + (delta / jnp.where(dx0, 1, dx)) * df)
+    f = jnp.where(x < xp[0], fp[0] if left is None else left, f)
+    f = jnp.where(x > xp[-1], fp[-1] if right is None else right, f)
+    return f
+
+
+def _correct_search_index(idx, x, xp):
+    """idx -> searchsorted(xp, x, side='right') for an estimate off by at most one."""
+    n = xp.shape[0]
+    idx = idx - ((idx > 0) & (xp[jnp.clip(idx - 1, 0, n - 1)] > x)).astype(idx.dtype)
+    idx = idx + ((idx < n) & (xp[jnp.clip(idx, 0, n - 1)] <= x)).astype(idx.dtype)
+    return idx
+
+
+def _interp_uniform_target_exact(x_grid, x_min, dx, xp, fp, left, right):
+    """jnp.interp(x_grid, xp, fp, left, right) for x_grid = x_min + i*dx and sorted xp."""
+    n_new = x_grid.shape[0]
+    n = xp.shape[0]
+    c = jnp.clip(jnp.ceil((xp - x_min) / dx), 0, n_new).astype(jnp.int32)
+    h = jnp.zeros(n_new + 1, dtype=jnp.int32).at[c].add(1)
+    idx = _correct_search_index(jnp.cumsum(h)[:n_new], x_grid, xp)
+    return _interp_formula(x_grid, xp, fp, jnp.clip(idx, 1, n - 1), left, right)
+
+
+def _interp_uniform_source_exact(x_new, x0, fp, left, right):
+    """jnp.interp(x_new, x0, fp, left, right) for a uniform source grid x0."""
+    n = x0.shape[0]
+    est = jnp.clip(jnp.floor((x_new - x0[0]) / (x0[1] - x0[0])).astype(jnp.int32) + 1, 0, n)
+    idx = _correct_search_index(est, x_new, x0)
+    return _interp_formula(x_new, x0, fp, jnp.clip(idx, 1, n - 1), left, right)
+
+
+# ---------------------------------------------------------------------------
 # Searchsorted-free interpolation for the abundance hot path.
 # fft_mode="tpu_direct" selects it (set once at cnc.initialise). Stage-1
 # on-device attribution (micro_bench_tpu.py, v6e-1, 2026-07-10): the batched
@@ -58,6 +122,10 @@ def interp_to_uniform_grid(x_grid, x_min, dx, xp, fp):
     the analytic positions ceil((xp - x_min)/dx) followed by a cumsum.
     """
     if not _TPU_INTERP:
+        if (_EXACT_SEARCH_FREE and x_grid.ndim == 1 and xp.ndim == 1
+                and jnp.issubdtype(xp.dtype, jnp.floating)
+                and x_grid.dtype == xp.dtype and fp.dtype == xp.dtype):
+            return _interp_uniform_target_exact(x_grid, x_min, dx, xp, fp, 0., 0.)
         return jnp.interp(x_grid, xp, fp, left=0., right=0.)
     n_new = x_grid.shape[0]
     p = (xp - x_min) / dx
@@ -84,6 +152,13 @@ def interp_from_uniform_grid(x_new, x0, fp, left=0.):
     and the right edge clamps to fp[-1] (jnp.interp's defaults).
     Default path: jnp.interp (unchanged)."""
     if not _TPU_INTERP:
+        if _EXACT_SEARCH_FREE:
+            # only when no dtype promotion would be needed (jnp.interp promotes; here every
+            # input must already be the same floating type), otherwise fall through
+            x_new_a = jnp.asarray(x_new); x0_a = jnp.asarray(x0); fp_a = jnp.asarray(fp)
+            if (x0_a.ndim == 1 and jnp.issubdtype(x0_a.dtype, jnp.floating)
+                    and x_new_a.dtype == x0_a.dtype and fp_a.dtype == x0_a.dtype):
+                return _interp_uniform_source_exact(x_new_a, x0_a, fp_a, left, None)
         if left is None:
             return jnp.interp(x_new, x0, fp)
         return jnp.interp(x_new, x0, fp, left=left)

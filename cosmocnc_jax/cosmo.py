@@ -1,4 +1,5 @@
 import numpy as np
+from cosmocnc_jax.tracing import is_traced, to_float, xp_for, trapezoid
 import jax
 import jax.numpy as jnp
 
@@ -32,7 +33,7 @@ _THETA_Y_TAB, _THETA_G_TAB = _theta_build_g_table()
 
 
 def _theta_g_of_y(y):
-    return np.interp(y, _THETA_Y_TAB, _THETA_G_TAB)
+    return xp_for(y).interp(y, _THETA_Y_TAB, _THETA_G_TAB)
 
 
 # hmfast emulator_set name for each cosmocnc cosmo_model.
@@ -275,7 +276,7 @@ class cosmology_model:
             # Initialize direct emulator interface (bypasses Cython for MCMC)
             from cosmocnc_jax.emulators import (
                 init_emulators, extract_pk_power_fac, make_predict_fns,
-                make_sigma8_solver, make_sigma8_function
+                make_sigma8_solver, make_sigma8_function, make_sigma8_solver_checked
             )
             self._emu, self._emu_param_orders, self._z_interp = init_emulators(
                 self.cnc_params['cosmo_model'])
@@ -287,6 +288,9 @@ class cosmology_model:
             lnAs_index = self._emu_param_orders['der'].index('ln10^{10}A_s')
             self._find_lnAs = make_sigma8_solver(self._emu['der'], lnAs_index)
             self._sigma8_of_lnAs = make_sigma8_function(self._emu['der'], lnAs_index)
+            self._find_lnAs_checked = make_sigma8_solver_checked(
+                self._emu['der'], lnAs_index, self._LNAS_MIN, self._LNAS_MAX,
+                self._LNAS_DEFAULT, self._SIGMA8_RTOL)
             self._lnAs_index = lnAs_index
 
             # Extract derived quantities using direct emulators
@@ -295,6 +299,9 @@ class cosmology_model:
             # Create JAX-compatible wrapper for background/power spectrum
             self.power_spectrum = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
             self.background_cosmology = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
+            if hasattr(self, '_predict_H'):
+                self.background_cosmology._predict_H = self._predict_H
+                self.background_cosmology._h_param_order = self._emu_param_orders['h']
             self.background_cosmology.H0.value = self.cosmo_params["h"]*100.
 
             # Mass conversion functions still go through C code (not in hot path)
@@ -351,7 +358,7 @@ class cosmology_model:
             'omega_cdm': (cp["Om0"] - cp["Ob0"]) * h**2,
             'tau_reio': cp["tau_reio"],
             'n_s': cp["n_s"],
-            'ln10^{10}A_s': np.log(cp.get("A_s", 2.1e-9) * 1e10),
+            'ln10^{10}A_s': xp_for(cp.get("A_s", 2.1e-9)).log(cp.get("A_s", 2.1e-9) * 1e10),
             'm_ncdm': cp.get("m_nu", 0.06),
         }
 
@@ -383,6 +390,15 @@ class cosmology_model:
         """
         from cosmocnc_jax.emulators import build_cosmo_vec
         cosmo_vec_der = build_cosmo_vec(self._pvd, self._emu_param_orders['der'])
+        if is_traced(sigma8_target, cosmo_vec_der):
+            # Under a trace (whole-evaluation jit / vmap): the same Newton step, acceptance
+            # test and bracketed fallback, expressed in JAX, started from the default value
+            # (a pure function has no previous call to warm-start from). A target that
+            # cannot be reached is flagged in self._lnAs_ok instead of raising.
+            lnAs, ok = self._find_lnAs_checked(cosmo_vec_der, sigma8_target)
+            self._lnAs_ok = ok
+            return jnp.exp(lnAs) / 1e10, lnAs
+        self._lnAs_ok = True
         sigma8_target = float(sigma8_target)
         lnAs_init = self._pvd['ln10^{10}A_s']
         if not (np.isfinite(lnAs_init) and self._LNAS_MIN <= lnAs_init <= self._LNAS_MAX):
@@ -435,17 +451,17 @@ class cosmology_model:
         cosmo_vec_der = build_cosmo_vec(self._pvd, self._emu_param_orders['der'])
         der = self._predict_der(cosmo_vec_der)
         # der array: [100*theta_s, sigma8, YHe, z_reio, Neff, tau_rec, z_rec, rs_rec, ra_rec, ...]
-        self.sigma8 = float(der[1])
+        self.sigma8 = to_float(der[1])
         self.cosmo_params["sigma_8"] = self.sigma8
-        self.N_eff = float(der[4])
-        self.z_CMB = float(der[6])  # z_rec
+        self.N_eff = to_float(der[4])
+        self.z_CMB = to_float(der[6])  # z_rec
 
         if self.amplitude_parameter == "A_s":
             self.As = self.cosmo_params["A_s"]
 
         # D_CMB from DER emulator: der[8] = ra_rec (comoving dist to recomb in Mpc)
         # D_CMB = da_rec = ra_rec / (1 + z_rec) = angular diameter distance at recombination
-        self.D_CMB = float(der[8]) / (1. + self.z_CMB)
+        self.D_CMB = to_float(der[8]) / (1. + self.z_CMB)
 
         if not hasattr(self, 'T_CMB_0'):
             self.T_CMB_0 = self.classy.T_cmb()
@@ -463,7 +479,7 @@ class cosmology_model:
         Omega-budget attributes used by _Omega_m_z_nonu. Shared by all
         cosmology backends (classy_sz_jax, hmfast, cobaya) so the same
         Delta-conversion formula is fed consistent components."""
-        self.Omega_nu = float(Oncdm)
+        self.Omega_nu = to_float(Oncdm)
         self.cosmo_params["Onu0"] = self.Omega_nu
         self._Om0 = Ocdm + Ob + Oncdm
         self._Om0_nonu = self._Om0 - Oncdm
@@ -794,7 +810,8 @@ class cosmology_model:
         is extracted with the RESOLVED A_s pvd -- which is what the
         classy_sz_jax branch effectively does.
         """
-        from cosmocnc_jax.emulators import init_emulators, make_sigma8_solver, make_sigma8_function
+        from cosmocnc_jax.emulators import (init_emulators, make_sigma8_solver, make_sigma8_function,
+                                            make_sigma8_solver_checked)
 
         self._emu, self._emu_param_orders, self._z_interp = init_emulators(
             self.cnc_params['cosmo_model'])
@@ -811,6 +828,9 @@ class cosmology_model:
         lnAs_index = self._emu_param_orders['der'].index('ln10^{10}A_s')
         self._find_lnAs = make_sigma8_solver(self._emu['der'], lnAs_index)
         self._sigma8_of_lnAs = make_sigma8_function(self._emu['der'], lnAs_index)
+        self._find_lnAs_checked = make_sigma8_solver_checked(
+            self._emu['der'], lnAs_index, self._LNAS_MIN, self._LNAS_MAX,
+            self._LNAS_DEFAULT, self._SIGMA8_RTOL)
         self._lnAs_index = lnAs_index
 
     def _finalize_classy_predict_fns_for_hmfast(self):
@@ -1109,6 +1129,9 @@ class cosmology_model:
             # Update wrappers with new params
             self.power_spectrum = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
             self.background_cosmology = classy_sz_jax_cosmo(self.classy, self.cosmo_params, self._pvd)
+            if hasattr(self, '_predict_H'):
+                self.background_cosmology._predict_H = self._predict_H
+                self.background_cosmology._h_param_order = self._emu_param_orders['h']
             self.background_cosmology.H0.value = self.cosmo_params["h"]*100.
 
         elif cosmology_tool == "hmfast":
@@ -1196,6 +1219,9 @@ class cosmology_model:
             return float(self._camb_theta_mc)
 
         h = self.cosmo_params["h"]
+        # NumPy on concrete values (unchanged); jax.numpy when the cosmology is traced
+        xp = xp_for(h, self.cosmo_params["Ob0"], self.cosmo_params["Om0"],
+                    self.cosmo_params.get("m_nu", 0.06), self.D_CMB, self.z_CMB)
         H0_over_c = (h*100.)/(constants().c_light/1e3)            # H0/c in 1/Mpc
 
         ombh2 = self.cosmo_params["Ob0"]*h**2
@@ -1220,23 +1246,23 @@ class cosmology_model:
 
         def H_over_c(a):
             E2 = Ocb*a**-3 + Ogamma_massless*a**-4 + Om_massive_rel*_theta_g_of_y(a*y0)*a**-4 + OL0
-            return H0_over_c*np.sqrt(E2)
+            return H0_over_c*xp.sqrt(E2)
 
         # comoving sound horizon to z_star (CAMB dsound_da_approx: R = 3e4 a ombh2)
-        a_rs = np.linspace(1e-8, a_star, 4000)
-        rs_int = 1./(a_rs**2*H_over_c(a_rs)*np.sqrt(3.*(1.+3.0e4*a_rs*ombh2)))
-        r_sound = np.trapezoid(rs_int, a_rs)
+        a_rs = xp.linspace(1e-8, a_star, 4000)
+        rs_int = 1./(a_rs**2*H_over_c(a_rs)*xp.sqrt(3.*(1.+3.0e4*a_rs*ombh2)))
+        r_sound = trapezoid(rs_int, a_rs, xp)
 
         # comoving (radial) distance to z_star = ra_rec (current, der emulator) + analytic high-z correction
         ra_rec = self.D_CMB*(1.+self.z_CMB)                     # D_CMB = da_rec = ra_rec/(1+z_rec)
         a_zrec = 1./(1.+self.z_CMB)
-        a_corr = np.linspace(a_star, a_zrec, 500)
-        DC_corr = np.trapezoid(1./(a_corr**2*H_over_c(a_corr)), a_corr)
+        a_corr = xp.linspace(a_star, a_zrec, 500)
+        DC_corr = trapezoid(1./(a_corr**2*H_over_c(a_corr)), a_corr, xp)
         D_comoving = ra_rec + DC_corr
 
         theta_mc = r_sound/D_comoving
 
-        return float(theta_mc)
+        return to_float(theta_mc)
 
     def get_z_cmb(self):
 
@@ -1267,6 +1293,21 @@ class classy_sz_jax_cosmo:
         self.pvd = params_values_dict
         self.const = constants()
         self._h = cosmo_params["h"]
+        # set by cosmology_model: (cosmo_vec_h, z_vec) -> H/c [1/Mpc] from the direct H emulator,
+        # and the emulator's parameter order; used only when the parameters are traced
+        self._predict_H = None
+        self._h_param_order = None
+
+    def _traced(self):
+        return self._predict_H is not None and is_traced(*self.pvd.values())
+
+    def _H_over_c_traced(self, z):
+        """H(z)/c [1/Mpc] from the direct H emulator (the same network and z grid the
+        non-traced calls interpolate)."""
+        from cosmocnc_jax.emulators import build_cosmo_vec
+        z = jnp.asarray(z, dtype=jnp.float64)
+        vec = build_cosmo_vec(self.pvd, self._h_param_order)
+        return self._predict_H(vec, jnp.atleast_1d(z)).reshape(z.shape)
 
     def get_linear_power_spectrum(self, redshift):
         pk, k = self.classy.get_pkl_at_z(redshift, params_values_dict=self.pvd)
@@ -1286,7 +1327,12 @@ class classy_sz_jax_cosmo:
 
     def critical_density(self, z):
         h = self._h
-        rho = self.classy.get_rho_crit_at_z(z, params_values_dict=self.pvd)
+        if self._traced():
+            # same expression and constants as classy_szfast get_rho_crit_at_z
+            _H = self._H_over_c_traced(z)
+            rho = (3./(8.*np.pi*6.67428e-11*1.98855e30))*pow(3.085677581282e22, 1)*(2.99792458e8)**2*_H**2/h**2
+        else:
+            rho = self.classy.get_rho_crit_at_z(z, params_values_dict=self.pvd)
         rho = jnp.asarray(rho)
 
         if jax.config.jax_enable_x64:
@@ -1337,7 +1383,10 @@ class classy_sz_jax_cosmo:
     def H(self, z):
         # get_hubble_at_z returns H(z) in 1/Mpc; convert to km/s/Mpc
         conv_fac = 299792.458
-        hz = self.classy.get_hubble_at_z(z, params_values_dict=self.pvd)
+        if self._traced():
+            hz = self._H_over_c_traced(z)
+        else:
+            hz = self.classy.get_hubble_at_z(z, params_values_dict=self.pvd)
         hz = jnp.asarray(hz)
 
         class result:
