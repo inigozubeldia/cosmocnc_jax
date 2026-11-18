@@ -1775,8 +1775,11 @@ class cluster_number_counts:
 
         #Define redshift and observable ranges
 
-        self.redshift_vec = jnp.linspace(self.cnc_params["z_min"],self.cnc_params["z_max"],self.cnc_params["n_z"])
-        self.obs_select_vec = jnp.linspace(self.cnc_params["obs_select_min"],self.cnc_params["obs_select_max"],self.cnc_params["n_points"])
+        # constant grids: evaluated eagerly also inside a whole-evaluation trace, so that they
+        # stay concrete arrays (same values as in an ordinary call)
+        with jax.ensure_compile_time_eval():
+            self.redshift_vec = jnp.linspace(self.cnc_params["z_min"],self.cnc_params["z_max"],self.cnc_params["n_z"])
+            self.obs_select_vec = jnp.linspace(self.cnc_params["obs_select_min"],self.cnc_params["obs_select_max"],self.cnc_params["n_points"])
 
         #Evaluate some useful quantities (to be potentially passed to scaling relations)
 
@@ -1842,7 +1845,8 @@ class cluster_number_counts:
             if self.cnc_params["hmf_calc"] == "cnc" and self.cnc_params["hmf_type"] in ("Tinker08", "Tinker10", "Castro23"):
 
                 # Precompute sigma arrays for all redshifts using mcfit JAX backend
-                M_vec = jnp.exp(jnp.linspace(jnp.log(self.cnc_params["M_min"]),jnp.log(self.cnc_params["M_max"]),self.cnc_params["n_points"]))
+                with jax.ensure_compile_time_eval():   # constant mass grid (see redshift_vec above)
+                    M_vec = jnp.exp(jnp.linspace(jnp.log(self.cnc_params["M_min"]),jnp.log(self.cnc_params["M_max"]),self.cnc_params["n_points"]))
                 rho_m = self.halo_mass_function.rho_c_0 * self.cosmology.cosmo_params["Om0"]
 
                 delta_num = float(self.cnc_params["mass_definition"][0:-1])
@@ -2009,7 +2013,8 @@ class cluster_number_counts:
                     self.castro_sigma_vir_matrix = sigma_vir_matrix
                     self.castro_Om_z_nonu_vec = Om_z_nonu_vec
 
-                self.ln_M = jnp.log(M_vec/1e14)
+                with jax.ensure_compile_time_eval():
+                    self.ln_M = jnp.log(M_vec/1e14)
 
             else:
                 # Fallback for hmf_calc="hmf" — keep original loop
