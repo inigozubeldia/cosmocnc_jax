@@ -204,3 +204,20 @@ def make_sigma8_solver(der_emulator, lnAs_index):
         return jax.lax.fori_loop(0, 8, body, lnAs_init)
 
     return find_lnAs
+
+
+def make_sigma8_function(der_emulator, lnAs_index):
+    """JIT-compiled sigma8 as a function of lnAs at fixed other parameters.
+
+    Companion of make_sigma8_solver: used to verify a solution of the Newton
+    solve and to bracket the root when the Newton solve has to be replaced.
+
+    Returns:
+        sigma8_of_lnAs: JIT-compiled function (cosmo_vec_der, lnAs) -> sigma8
+    """
+    @jax.jit
+    def sigma8_of_lnAs(cosmo_vec_der, lnAs):
+        vec = cosmo_vec_der.at[lnAs_index].set(lnAs)
+        return _call_emulator(der_emulator, vec)[1]
+
+    return sigma8_of_lnAs

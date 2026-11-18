@@ -275,7 +275,7 @@ class cosmology_model:
             # Initialize direct emulator interface (bypasses Cython for MCMC)
             from cosmocnc_jax.emulators import (
                 init_emulators, extract_pk_power_fac, make_predict_fns,
-                make_sigma8_solver
+                make_sigma8_solver, make_sigma8_function
             )
             self._emu, self._emu_param_orders, self._z_interp = init_emulators(
                 self.cnc_params['cosmo_model'])
@@ -286,6 +286,7 @@ class cosmology_model:
                                  self._z_interp, self._pk_power_fac)
             lnAs_index = self._emu_param_orders['der'].index('ln10^{10}A_s')
             self._find_lnAs = make_sigma8_solver(self._emu['der'], lnAs_index)
+            self._sigma8_of_lnAs = make_sigma8_function(self._emu['der'], lnAs_index)
             self._lnAs_index = lnAs_index
 
             # Extract derived quantities using direct emulators
@@ -354,15 +355,69 @@ class cosmology_model:
             'm_ncdm': cp.get("m_nu", 0.06),
         }
 
+    # Range of ln(10^10 A_s) inside which the sigma_8 -> A_s solve is accepted. The emulated
+    # sigma_8(ln A_s) is not monotonic over the whole real line: far below the range it turns
+    # around and far above it diverges, so a second, spurious root of sigma_8(ln A_s) = target
+    # exists outside. The Newton solve is warm-started from the previous call's solution, so
+    # a single call that lands on the spurious branch would otherwise be inherited by every
+    # later call of the same process.
+    _LNAS_MIN = 1.5
+    _LNAS_MAX = 5.5
+    _LNAS_DEFAULT = float(np.log(2.1e-9 * 1e10))
+    _SIGMA8_RTOL = 1e-8
+
+    def _lnAs_solution_ok(self, cosmo_vec_der, lnAs, sigma8_target):
+        if not (np.isfinite(lnAs) and self._LNAS_MIN <= lnAs <= self._LNAS_MAX):
+            return False
+        s8 = float(self._sigma8_of_lnAs(cosmo_vec_der, jnp.float64(lnAs)))
+        return bool(np.isfinite(s8) and abs(s8 - sigma8_target) <= self._SIGMA8_RTOL * abs(sigma8_target))
+
     def _find_As_from_sigma8_jax(self, sigma8_target):
-        """Find A_s from sigma_8 using JIT'd DER emulator Newton solver."""
+        """Find A_s from sigma_8 using JIT'd DER emulator Newton solver.
+
+        The Newton solve and its warm start are unchanged whenever they work. Safeguards:
+        a stored starting value that is not finite or lies outside [_LNAS_MIN, _LNAS_MAX] is
+        replaced by the default; the solution must be finite, inside the range and reproduce
+        the target; otherwise the root is bracketed and bisected inside the range, and if
+        the target cannot be reached there a ValueError is raised and the stored A_s is reset.
+        """
         from cosmocnc_jax.emulators import build_cosmo_vec
         cosmo_vec_der = build_cosmo_vec(self._pvd, self._emu_param_orders['der'])
+        sigma8_target = float(sigma8_target)
         lnAs_init = self._pvd['ln10^{10}A_s']
+        if not (np.isfinite(lnAs_init) and self._LNAS_MIN <= lnAs_init <= self._LNAS_MAX):
+            lnAs_init = self._LNAS_DEFAULT
         lnAs = float(self._find_lnAs(
             cosmo_vec_der, jnp.float64(sigma8_target), jnp.float64(lnAs_init)))
+        if not self._lnAs_solution_ok(cosmo_vec_der, lnAs, sigma8_target):
+            lnAs = self._solve_lnAs_bracketed(cosmo_vec_der, sigma8_target)
         A_s = np.exp(lnAs) / 1e10
         return A_s, lnAs
+
+    def _solve_lnAs_bracketed(self, cosmo_vec_der, sigma8_target):
+        """Bisection for sigma_8(ln A_s) = target inside [_LNAS_MIN, _LNAS_MAX]."""
+        lo, hi = self._LNAS_MIN, self._LNAS_MAX
+        s_lo = float(self._sigma8_of_lnAs(cosmo_vec_der, jnp.float64(lo)))
+        s_hi = float(self._sigma8_of_lnAs(cosmo_vec_der, jnp.float64(hi)))
+        if not (np.isfinite(s_lo) and np.isfinite(s_hi) and s_lo < sigma8_target < s_hi):
+            # leave a clean starting value for the next call before reporting the failure
+            self.cosmo_params["A_s"] = float(np.exp(self._LNAS_DEFAULT) / 1e10)
+            raise ValueError(
+                f"sigma_8 = {sigma8_target} cannot be reached with ln(10^10 A_s) in "
+                f"[{lo}, {hi}] at this cosmology (sigma_8 at the two ends: {s_lo}, {s_hi})")
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if float(self._sigma8_of_lnAs(cosmo_vec_der, jnp.float64(mid))) < sigma8_target:
+                lo = mid
+            else:
+                hi = mid
+        lnAs = 0.5 * (lo + hi)
+        if not self._lnAs_solution_ok(cosmo_vec_der, lnAs, sigma8_target):
+            self.cosmo_params["A_s"] = float(np.exp(self._LNAS_DEFAULT) / 1e10)
+            raise ValueError(
+                f"sigma_8 -> A_s solve did not converge for sigma_8 = {sigma8_target} "
+                f"(the emulated sigma_8 is not monotonic inside [{self._LNAS_MIN}, {self._LNAS_MAX}])")
+        return lnAs
 
     def _extract_derived_from_jax(self):
         """Extract derived cosmological quantities using direct DER emulator."""
@@ -739,7 +794,7 @@ class cosmology_model:
         is extracted with the RESOLVED A_s pvd -- which is what the
         classy_sz_jax branch effectively does.
         """
-        from cosmocnc_jax.emulators import init_emulators, make_sigma8_solver
+        from cosmocnc_jax.emulators import init_emulators, make_sigma8_solver, make_sigma8_function
 
         self._emu, self._emu_param_orders, self._z_interp = init_emulators(
             self.cnc_params['cosmo_model'])
@@ -755,6 +810,7 @@ class cosmology_model:
 
         lnAs_index = self._emu_param_orders['der'].index('ln10^{10}A_s')
         self._find_lnAs = make_sigma8_solver(self._emu['der'], lnAs_index)
+        self._sigma8_of_lnAs = make_sigma8_function(self._emu['der'], lnAs_index)
         self._lnAs_index = lnAs_index
 
     def _finalize_classy_predict_fns_for_hmfast(self):
