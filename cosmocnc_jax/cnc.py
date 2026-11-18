@@ -1775,11 +1775,23 @@ class cluster_number_counts:
 
         #Define redshift and observable ranges
 
-        # constant grids: evaluated eagerly also inside a whole-evaluation trace, so that they
-        # stay concrete arrays (same values as in an ordinary call)
-        with jax.ensure_compile_time_eval():
+        # Constant grids. They depend only on the configuration, so the arrays of the first
+        # ordinary call are kept and reused: inside a whole-evaluation trace they are then the
+        # same concrete arrays (created under a trace they would be traced values).
+        _gk = (self.cnc_params["z_min"], self.cnc_params["z_max"], self.cnc_params["n_z"],
+               self.cnc_params["obs_select_min"], self.cnc_params["obs_select_max"],
+               self.cnc_params["n_points"], self.cnc_params["M_min"], self.cnc_params["M_max"])
+        _gc = getattr(self, "_constant_grids", None)
+        if _gc is not None and _gc["key"] == _gk:
+            self.redshift_vec = _gc["redshift_vec"]
+            self.obs_select_vec = _gc["obs_select_vec"]
+        else:
             self.redshift_vec = jnp.linspace(self.cnc_params["z_min"],self.cnc_params["z_max"],self.cnc_params["n_z"])
             self.obs_select_vec = jnp.linspace(self.cnc_params["obs_select_min"],self.cnc_params["obs_select_max"],self.cnc_params["n_points"])
+            _gc = None
+            if not is_traced(self.redshift_vec, self.obs_select_vec):
+                _gc = {"key": _gk, "redshift_vec": self.redshift_vec, "obs_select_vec": self.obs_select_vec}
+                self._constant_grids = _gc
 
         #Evaluate some useful quantities (to be potentially passed to scaling relations)
 
@@ -1845,8 +1857,13 @@ class cluster_number_counts:
             if self.cnc_params["hmf_calc"] == "cnc" and self.cnc_params["hmf_type"] in ("Tinker08", "Tinker10", "Castro23"):
 
                 # Precompute sigma arrays for all redshifts using mcfit JAX backend
-                with jax.ensure_compile_time_eval():   # constant mass grid (see redshift_vec above)
+                # constant mass grid, kept with the other constant grids (see redshift_vec above)
+                if _gc is not None and "M_vec" in _gc:
+                    M_vec = _gc["M_vec"]
+                else:
                     M_vec = jnp.exp(jnp.linspace(jnp.log(self.cnc_params["M_min"]),jnp.log(self.cnc_params["M_max"]),self.cnc_params["n_points"]))
+                    if _gc is not None and not is_traced(M_vec):
+                        _gc["M_vec"] = M_vec
                 rho_m = self.halo_mass_function.rho_c_0 * self.cosmology.cosmo_params["Om0"]
 
                 delta_num = float(self.cnc_params["mass_definition"][0:-1])
@@ -2013,8 +2030,12 @@ class cluster_number_counts:
                     self.castro_sigma_vir_matrix = sigma_vir_matrix
                     self.castro_Om_z_nonu_vec = Om_z_nonu_vec
 
-                with jax.ensure_compile_time_eval():
+                if _gc is not None and "ln_M" in _gc:
+                    self.ln_M = _gc["ln_M"]
+                else:
                     self.ln_M = jnp.log(M_vec/1e14)
+                    if _gc is not None and not is_traced(self.ln_M):
+                        _gc["ln_M"] = self.ln_M
 
             else:
                 # Fallback for hmf_calc="hmf" — keep original loop
@@ -3494,7 +3515,8 @@ class cluster_number_counts:
         names = tuple(param_names)
         # catalogue-side caches and the FFTLog objects are built by the first ordinary
         # evaluation; make sure they exist as concrete arrays before tracing
-        if (not hasattr(self, "_bc_cached")) or (not hasattr(self, "_tv0")):
+        if ((not hasattr(self, "_bc_cached")) or (not hasattr(self, "_tv0"))
+                or "ln_M" not in (getattr(self, "_constant_grids", None) or {})):
             self.update_params(self.cosmo_params, self.scal_rel_params)
             self.get_log_lik()
         base_cosmo = dict(self.cosmo_params)
