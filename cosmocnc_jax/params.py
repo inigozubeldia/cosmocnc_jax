@@ -39,6 +39,12 @@ cnc_params_default = {
     # quadrature at the abundance layer 0 and the 1D backward conv. Guards: selection
     # observable must be 2-layer and sit in a 1-observable correlation set.
     "mass_dep_scatter": False,
+    # Catalogue simulator only (sim.py): layer-0 intrinsic scatter of the observables for which the
+    # survey scatter class declares x_dep_scatter taken from get_std_x at each simulated cluster's own
+    # (ln M, z). Default False = the covariance from get_cov. Independent of "mass_dep_scatter" (the
+    # likelihood's gate, whose guards concern the correlation-set structure of an inference run).
+    "sim_mass_dep_scatter": False,
+    "sim_store_layer_values": False,   # simulator: keep each layer's values before / after the scatter (tests)
     "bc_chunk_size": 2000,  # backward conv chunk size (GPU-optimal for no-zerr path)
     "bc_sparse_sets": False,  # evaluate the backward convolution of a 1-observable correlation set only for the clusters
                               # that have that observable (the others never use its result); same values
