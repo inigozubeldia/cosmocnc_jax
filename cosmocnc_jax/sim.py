@@ -295,6 +295,7 @@ class catalogue_generator:
         self._D_l_CMB_vec = jnp.asarray(nc.D_l_CMB)
         self._rho_c_vec = jnp.asarray(nc.rho_c)
         self._H0 = nc.cosmology.cosmo_params["h"] * 100.
+        self._h = float(nc.cosmology.cosmo_params["h"])   # passed to scatter.get_std_x exactly as the likelihood passes it
         self._D_CMB = nc.cosmology.D_CMB
         self._gamma = cosmocnc_jax.constants().gamma
 
@@ -316,12 +317,12 @@ class catalogue_generator:
         get_std_x(lnM=(n_x,), other_params={"zc": (n_zc,), "h": h}) returns the (n_zc, n_x) table the
         likelihood interpolates; here it is evaluated on a chunk of clusters and its diagonal taken, so
         entry k is sigma(z_k, M_k). ln_M is ln(M / 1e14 Msun) on the generator's own mass grid
-        convention (number_counts.ln_M), h the generation value.
+        convention (number_counts.ln_M); h = cosmo_params["h"] at generation, the value the likelihood passes.
         """
         ln_M = np.asarray(ln_M, dtype=np.float64)
         z = np.asarray(z, dtype=np.float64)
         assert ln_M.shape == z.shape and ln_M.ndim == 1
-        h = float(self._H0) / 100.
+        h = self._h
         out = np.empty(len(z), dtype=np.float64)
         for a in range(0, len(z), chunk):
             n = len(z[a:a + chunk])
