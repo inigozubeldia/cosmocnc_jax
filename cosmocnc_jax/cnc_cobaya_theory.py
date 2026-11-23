@@ -27,7 +27,8 @@ _CNC_PARAM_KEYS = (
     "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
     # observables / catalogue
     "load_catalogue", "precompute_cnc_quantities_catalogue", "likelihood_type",
-    "obs_select", "observables", "observables_mass_estimation", "cluster_catalogue",
+    "obs_select", "observables", "observables_mass_estimation", "n_points_mass_estimation",
+    "mass_estimation_full_range", "cluster_catalogue",
     "data_lik_from_abundance", "data_lik_type", "abundance_integral_type",
     "compute_abundance_matrix", "catalogue_params", "apply_obs_cutoff",
     "delta_m_with_ref",   # NB: get_masses handled separately (Cobaya reserves get_*)
@@ -185,7 +186,9 @@ class cnc(classy):
     obs_select : Optional[str] =  "q_mmf3_mean" #"q_mmf3_mean",
     observables : Optional[str] =  [["q_mmf3_mean","p_zc19"]]
 #    "observables": [["q_mmf3_mean"]],
-    observables_mass_estimation : Optional[str] =  ["q_mmf3_mean"]
+    observables_mass_estimation : Optional[str] =  None   # None = the correlation sets of "observables"; see cnc.get_masses
+    n_points_mass_estimation : Optional[int] = None
+    mass_estimation_full_range : Optional[bool] = False
     cluster_catalogue :Optional[str] =  "zc19_simulated_12"
     #"cluster_catalogue":"zc19_simulated_12",#"Planck_MMF3_cosmo",
     #"cluster_catalogue":"q_mlens_simulated",
