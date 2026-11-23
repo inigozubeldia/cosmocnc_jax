@@ -12,6 +12,7 @@ from .params import *
 from .utils import *
 import jax.scipy.special
 from .tracing import is_traced, to_float
+from jax.scipy.special import erfc as jsp_erfc
 import logging
 import time
 import importlib.util
@@ -111,7 +112,8 @@ def _bilinear_interp_2d(xi0, xi1, grid, x0_start, dx0, n0, x1_start, dx1, n1):
 
 
 def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs,
-                           nd_circular=True, xdep_scatter_layer0=False):
+                           nd_circular=True, xdep_scatter_layer0=False,
+                           selection_probability=False, obs_range=None):
     """Factory: build an N-dimensional backward conv for a correlation set.
 
     Handles N correlated observables with full covariance structure across layers.
@@ -136,6 +138,16 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
             sigma for its grid bounds — a window-sizing approximation when
             sigma varies strongly across the grid (both twins share it).
 
+        selection_probability: STATIC bool [mass-estimation pass only, default
+            OFF; n_obs == 1 ONLY]. When True the last-layer Gaussian pdf at the
+            observed value is replaced by its integral over the observed range
+            obs_range = (obs_min, obs_max), i.e. the probability that the
+            observable falls inside the selection range given the layer-1 mean.
+            Everything after it (cutoff, layer-0 scatter, mean cut) is
+            unchanged, so the returned function is the detection probability
+            as a function of mass instead of the pdf of the observed value.
+            The observed value passed in is ignored.
+
     Returns:
         backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
                           cov_layer0, cov_layer1, n_points,
@@ -151,6 +163,11 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
     if xdep_scatter_layer0:
         assert n_obs == 1, "xdep_scatter_layer0 supports only 1-observable sets"
+    if selection_probability:
+        assert n_obs == 1, "selection_probability supports only 1-observable sets"
+        assert obs_range is not None and len(obs_range) == 2
+        _obs_lo = float(obs_range[0])
+        _obs_hi = float(obs_range[1])
 
     def backward_conv_nd(lnM, obs_vals, all_layer0_args, all_layer1_args,
                           cov_layer0, cov_layer1, n_points,
@@ -189,9 +206,16 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
         if n_obs == 1:
             # ── 1D path (same as build_backward_conv_1d) ──
-            cpdf = eval_gaussian_nd(
-                jnp.array(x_l1_residuals),  # (1, n_points)
-                cov=cov_layer1)
+            if selection_probability:
+                # P(obs_lo < observed < obs_hi | layer-1 mean), Gaussian of
+                # variance cov_layer1; erfc keeps the far tail accurate
+                _s1 = jnp.sqrt(2. * cov_layer1[0, 0])
+                cpdf = 0.5 * (jsp_erfc((_obs_lo - x_l1_raw[0]) / _s1)
+                              - jsp_erfc((_obs_hi - x_l1_raw[0]) / _s1))
+            else:
+                cpdf = eval_gaussian_nd(
+                    jnp.array(x_l1_residuals),  # (1, n_points)
+                    cov=cov_layer1)
 
             # Observable cutoff (on first/only observable)
             cpdf = jnp.where(apply_cutoff & (x_l1_raw[0] < cutoff_val), 0., cpdf)
@@ -1321,6 +1345,28 @@ class cluster_number_counts:
                     "x-dependent layer-0 scatter for no 2-layer observable")
             self._xdep_abundance = bool(self.scatter.x_dep_scatter(obs_select_name, obs_select_name, 0))
 
+        # [mass-estimation pass] settings of the internal instance built by get_masses
+        # (flag "_mass_estimation_instance"); on an ordinary instance nothing is excluded
+        # and the selection observable keeps its ordinary factor.
+        self._me_instance = bool(self.cnc_params.get("_mass_estimation_instance", False))
+        self._me_excluded = set()
+        self._me_selection_probability = False
+        if self._me_instance:
+            _me_sets = self._mass_estimation_sets()
+            _me_obs = set(o for _s in _me_sets for o in _s)
+            for _oset in self.cnc_params["observables"]:
+                for _o in _oset:
+                    if _o not in _me_obs:
+                        self._me_excluded.add(_o)
+            if obs_select_name in self._me_excluded:
+                # stays in the product, as the detection probability
+                self._me_excluded.discard(obs_select_name)
+                self._me_selection_probability = True
+                if sr_sel.get_n_layers() != 2:
+                    raise NotImplementedError(
+                        "observables_mass_estimation without the selection observable needs a "
+                        "2-layer selection observable")
+
         # ── 1. Backward conv functions per correlation set ──
         # _bc_set_fns: list of (bc_fn, obs_names_in_set) per correlation set
         # _bc_obs_list: flat list of all backward-conv observable names (for data gathering)
@@ -1370,10 +1416,21 @@ class cluster_number_counts:
             # row-quadrature kernel (guards above); every other set keeps the FFT
             _xdep_set = bool(self._xdep_scatter_on and n_obs_set == 1
                              and self.scatter.x_dep_scatter(bc_obs_in_set[0], bc_obs_in_set[0], 0))
+            # [mass-estimation pass] the selection observable's factor becomes the
+            # detection probability when the observable is left out of
+            # observables_mass_estimation (only on the internal instance of get_masses)
+            _selprob_set = bool(self._me_selection_probability and obs_select_name in bc_obs_in_set)
+            if _selprob_set and n_obs_set != 1:
+                raise NotImplementedError(
+                    "observables_mass_estimation without the selection observable is supported "
+                    "only when the selection observable is alone in its correlation set; got "
+                    f"{observable_set}")
             bc_set_fn = build_backward_conv_nd(
                 layer0_fns, layer1_fns, layer0_returns_aux_list, n_obs_set,
                 nd_circular=nd_circular,
-                xdep_scatter_layer0=_xdep_set)
+                xdep_scatter_layer0=_xdep_set,
+                selection_probability=_selprob_set,
+                obs_range=(self.cnc_params["obs_select_min"], self.cnc_params["obs_select_max"]))
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
             self._bc_set_xdep.append(_xdep_set)
@@ -2788,6 +2845,8 @@ class cluster_number_counts:
                     if obs_name in self.catalogue.catalogue:
                         vals = jnp.asarray(self.catalogue.catalogue[obs_name])[idx_bc]
                         has_mask = ~jnp.isnan(vals)
+                        if obs_name in self._me_excluded:   # [mass-estimation pass]
+                            has_mask = jnp.zeros_like(has_mask)
                         obs_data[obs_name] = (jnp.where(has_mask, vals, 0.), has_mask)
                     else:
                         n_bc = len(idx_bc)
@@ -2828,7 +2887,8 @@ class cluster_number_counts:
                         jnp.asarray(self.catalogue.catalogue[o])[idx_bc]
                         for o in self._1layer_obs_list])
                     _has_obs_1l = jnp.stack([
-                        ~jnp.isnan(jnp.asarray(self.catalogue.catalogue[o])[idx_bc])
+                        (~jnp.isnan(jnp.asarray(self.catalogue.catalogue[o])[idx_bc]))
+                        & (o not in self._me_excluded)   # [mass-estimation pass]
                         for o in self._1layer_obs_list])
                 else:
                     _obs_vals_1l = jnp.zeros((1, n_bc))
@@ -2939,6 +2999,12 @@ class cluster_number_counts:
                 ref_scatter_sigma, sigma_mass_prior,
                 lnM0_min, lnM0_max, lnM_coarse,
                 patch_clusters)
+
+            # [mass-estimation pass] every cluster on the full mass range of the
+            # mass function instead of the window around its selection observable
+            if self._me_instance and bool(self.cnc_params.get("mass_estimation_full_range", False)):
+                lnM_min = jnp.full_like(lnM_min, lnM0_min)
+                lnM_max = jnp.full_like(lnM_max, lnM0_max)
 
             # ── Stage 3: All-in-one backward conv + combine + integrate (single JIT) ──
             # Use pre-stacked obs arrays (immutable, cached)
@@ -3748,7 +3814,66 @@ class cluster_number_counts:
 
     #Retrieve cluster mean log masses
 
+    def _mass_estimation_sets(self):
+        """Correlation sets used for the mass estimates: observables_mass_estimation,
+        or the likelihood's own sets when it is None. Each set must be one of the
+        correlation sets of "observables"."""
+        obs = [list(s) for s in self.cnc_params["observables"]]
+        me = self.cnc_params.get("observables_mass_estimation", None)
+        if me is None:
+            return obs
+        if len(me) == 0 or not all(isinstance(s, (list, tuple)) for s in me):
+            raise ValueError(
+                "observables_mass_estimation must be None or a list of correlation sets "
+                f"(a list of lists of observable names); got {me}")
+        me = [list(s) for s in me]
+        for s in me:
+            if s not in obs:
+                raise ValueError(
+                    f"observables_mass_estimation: {s} is not one of the correlation sets of "
+                    f"'observables' ({obs}); the mass estimates use a subset of those sets")
+        return me
+
+    def _mass_estimation_is_dedicated(self):
+        """True if the mass estimates need their own pass, i.e. if any of the
+        mass-estimation settings differs from the likelihood's."""
+        obs = [list(s) for s in self.cnc_params["observables"]]
+        me = self._mass_estimation_sets()
+        same_sets = (len(me) == len(obs)) and all(s in me for s in obs)
+        return ((not same_sets)
+                or self.cnc_params.get("n_points_mass_estimation", None) is not None
+                or bool(self.cnc_params.get("mass_estimation_full_range", False)))
+
     def get_masses(self):
+        """Mass estimates of the clusters, from their mass posteriors.
+
+        Default settings (observables_mass_estimation None or equal to observables,
+        n_points_mass_estimation None, mass_estimation_full_range False): mean and
+        standard deviation of ln M from the posteriors of the last likelihood
+        evaluation (cluster_lnM, cluster_lnM_std, in the order of bc_cluster_indices).
+
+        Otherwise a dedicated pass is run at the current parameters, on an internal
+        instance built once, so that the likelihood evaluation itself is not changed:
+          - the posterior of each cluster is the product of the factors of the
+            correlation sets in observables_mass_estimation and the mass function;
+          - if the selection observable is not in observables_mass_estimation, its
+            factor is replaced by the detection probability, P(obs_select_min <
+            observed < obs_select_max | M), with the same scatter and cutoffs as in
+            the likelihood, and a cluster that has none of the other observables of
+            observables_mass_estimation gets no estimate (NaN);
+          - n_points_mass_estimation mass points (default n_points_data_lik);
+          - mass_estimation_full_range True: the grid spans the full mass range of
+            the mass function instead of the window around the selection observable.
+        Results, all in CATALOGUE order, NaN where there is no estimate:
+          mass_posterior_lnM  (n_clusters, n_points)  ln M grid of each cluster
+          mass_posterior_pdf  (n_clusters, n_points)  posterior of ln M, unit integral
+          cluster_lnM, cluster_lnM_std                mean and standard deviation of ln M
+          mass_posterior_available (n_clusters,) bool
+        """
+
+        if self._mass_estimation_is_dedicated():
+            self._get_masses_dedicated()
+            return
 
         # Use vectorized mass estimates from backward conv (no loop needed)
         if hasattr(self, 'bc_lnM_means'):
@@ -3762,6 +3887,80 @@ class cluster_number_counts:
             self.cluster_lnM_std = jax.vmap(
                 lambda c, m, n, mu: jnp.sqrt(simpson(m**2 * c, x=m) / n - mu**2)
             )(self.bc_cpdf_array, self.bc_lnM_array, norms, self.cluster_lnM)
+
+    def _get_masses_dedicated(self):
+
+        # one internal instance per combination of mass-estimation settings, built once
+        _key = (repr(self._mass_estimation_sets()),
+                self.cnc_params.get("n_points_mass_estimation", None),
+                bool(self.cnc_params.get("mass_estimation_full_range", False)))
+        if not hasattr(self, "_mass_nc_cache"):
+            self._mass_nc_cache = {}
+        if _key not in self._mass_nc_cache:
+            p = dict(self.cnc_params)
+            # undo the M_min_extended bookkeeping of __init__, which is applied again
+            if p.get("M_min_cutoff", None) is not None:
+                p["M_min"] = p["M_min_cutoff"]
+            n_me = p.get("n_points_mass_estimation", None)
+            p.update({"_mass_estimation_instance": True,
+                      "n_points_data_lik": int(p["n_points_data_lik"] if n_me is None else n_me),
+                      "data_lik_from_abundance": False,   # every cluster with a redshift gets a posterior
+                      "get_masses": False,
+                      "stacked_likelihood": False,
+                      "priors": False,
+                      "parallel_abundance_and_data": False})
+            h = cluster_number_counts(cnc_params=p)
+            h.cosmo_params = dict(self.cosmo_params)
+            h.scal_rel_params = dict(self.scal_rel_params)
+            h.initialise()
+            self._mass_nc_cache[_key] = h
+
+        h = self._mass_nc_cache[_key]
+        self._mass_nc = h
+        h.update_params(dict(self.cosmo_params), dict(self.scal_rel_params))
+        h.get_log_lik_unbinned()
+
+        n_cat = len(np.asarray(self.catalogue.catalogue[self.cnc_params["obs_select"]]))
+        idx = np.asarray(h.bc_cluster_indices, dtype=int)
+        cpdf = np.asarray(h.bc_cpdf_array, dtype=float)
+        lnM = np.asarray(h.bc_lnM_array, dtype=float)
+
+        # clusters with an estimate: all those in the pass, or, when the selection
+        # observable enters only through the detection probability, those with at
+        # least one of the other observables of observables_mass_estimation
+        available = np.ones(len(idx), dtype=bool)
+        if h._me_selection_probability:
+            available = np.zeros(len(idx), dtype=bool)
+            has = np.asarray(h._bc_cached['all_has_obs'])
+            for i, o in enumerate(h._bc_obs_list):
+                if o != self.cnc_params["obs_select"]:
+                    available |= has[i]
+            if len(h._1layer_obs_list) > 0:
+                has_1l = np.asarray(h._bc_cached['has_obs_1l'])
+                for i, o in enumerate(h._1layer_obs_list):
+                    if o != self.cnc_params["obs_select"]:
+                        available |= has_1l[i]
+
+        norm = np.asarray(jax.vmap(lambda c, m: simpson(c, x=m))(h.bc_cpdf_array, h.bc_lnM_array))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pdf = cpdf / norm[:, None]
+        mean = np.asarray(jax.vmap(lambda c, m: simpson(m * c, x=m))(jnp.asarray(pdf), h.bc_lnM_array))
+        var = np.asarray(jax.vmap(lambda c, m, mu: simpson((m - mu)**2 * c, x=m))(
+            jnp.asarray(pdf), h.bc_lnM_array, jnp.asarray(mean)))
+        std = np.sqrt(np.maximum(var, 0.))
+
+        n_pts = cpdf.shape[1]
+        self.mass_posterior_lnM = np.full((n_cat, n_pts), np.nan)
+        self.mass_posterior_pdf = np.full((n_cat, n_pts), np.nan)
+        self.cluster_lnM = np.full(n_cat, np.nan)
+        self.cluster_lnM_std = np.full(n_cat, np.nan)
+        self.mass_posterior_available = np.zeros(n_cat, dtype=bool)
+        sel = idx[available]
+        self.mass_posterior_lnM[sel] = lnM[available]
+        self.mass_posterior_pdf[sel] = pdf[available]
+        self.cluster_lnM[sel] = mean[available]
+        self.cluster_lnM_std[sel] = std[available]
+        self.mass_posterior_available[sel] = True
 
     def get_number_counts_false_detections(self):
 
