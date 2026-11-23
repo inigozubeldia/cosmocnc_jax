@@ -609,22 +609,50 @@ def build_mass_range_fn(layer0_fn, layer0_deriv_fn, layer1_fn, layer1_deriv_fn,
     return mass_range_fn
 
 
-def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
+def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False,
+                         xdep_scatter_layer0=False, xdep_chunk=256, xdep_src_bin=1):
     """Factory: build a stacked observable kernel for one cluster.
+
+    Args:
+        xdep_scatter_layer0: STATIC bool (closure). When True (only for
+            n_layers_stacked > 1) the layer-0 scatter applied to the cluster's
+            mass pdf is x-dependent: every mass point carries its own Gaussian
+            width, sigma(lnM), interpolated from (lnM_ref, sigma_x_row) onto
+            the cluster's mass grid -- the same table the per-cluster backward
+            convolution uses (scatter.get_std_x). The stationary FFT
+            convolution is replaced by the direct sum
+                pdf(y_j) = sum_i pdf(x_i) N(y_j - x_i; sigma_i)
+            on the same uniform layer-0 grid; the result is normalised to unit
+            integral as in the stationary path. With a constant sigma the two
+            agree to rounding. When False the kernel is the stationary one and
+            sigma_x_row / lnM_ref are ignored at trace time.
+        xdep_chunk: STATIC int. Output points evaluated per step of the direct
+            sum (bounds the size of the dense table: xdep_chunk x n_points).
+        xdep_src_bin: STATIC int, must divide n_points_stacked. 1 = the direct
+            sum over every point of the layer-0 grid. > 1: consecutive source
+            points are merged in groups of xdep_src_bin into one Gaussian each,
+            with the group's total weight, its weighted mean position and the
+            weighted mean of sigma^2 plus the weighted variance of the positions
+            within the group (moments matched to second order), which divides
+            the cost of the sum by xdep_src_bin. The source pdf on the layer-0
+            grid is a linear interpolation of the cluster's mass pdf, sampled
+            more coarsely, so groups narrower than sigma lose nothing.
 
     Returns:
         stacked_kernel(cpdf_with_hmf, lnM, layer0_args,
                         mean_fn_pref_args, mean_fn_sr_args,
                         sigma_scatter_0, sigma_scatter_min,
                         n_points_stacked, compute_stacked_cov,
-                        n_layers_stacked)
+                        n_layers_stacked, compute_full_cov=False,
+                        sigma_x_row=None, lnM_ref=None)
         -> (obs_mean, obs_var)
     """
     def stacked_kernel(cpdf_with_hmf, lnM,
                         layer0_args, mean_fn_pref_args, mean_fn_sr_args,
                         sigma_scatter_0, sigma_scatter_min,
                         n_points_stacked, compute_stacked_cov,
-                        n_layers_stacked, compute_full_cov=False):
+                        n_layers_stacked, compute_full_cov=False,
+                        sigma_x_row=None, lnM_ref=None):
         # Normalise cpdf
         norm = simpson(cpdf_with_hmf, x=lnM)
         cpdf = cpdf_with_hmf / jnp.maximum(norm, 1e-300)
@@ -644,8 +672,57 @@ def build_stacked_kernel(layer0_fn, mean_fn, layer0_returns_aux=False):
             x1_interp = jnp.linspace(jnp.min(x1), jnp.max(x1), n_points_stacked)
             cpdf = jnp.interp(x1_interp, x1, cpdf, left=0., right=0.)
 
-            cpdf = convolve_1d(x1_interp, cpdf, sigma=sigma_scatter_0,
-                                sigma_min=sigma_scatter_min)
+            if xdep_scatter_layer0:
+                # x-dependent layer-0 scatter: sigma on the cluster's mass grid
+                # (from the reference table), carried to the uniform layer-0
+                # grid along the same mapping as the pdf; then the direct sum
+                # over source points, each with its own normalised Gaussian
+                # (the 1/sigma_i factor matters once sigma varies; constant
+                # factors drop in the normalisation below).
+                sig_m = jnp.interp(lnM, lnM_ref, sigma_x_row)
+                sig_i = jnp.maximum(jnp.interp(x1_interp, x1, sig_m), 1e-30)
+                if xdep_src_bin > 1:
+                    assert n_points_stacked % xdep_src_bin == 0, (
+                        f"xdep_src_bin={xdep_src_bin} must divide n_points={n_points_stacked}")
+                    _ng = n_points_stacked // xdep_src_bin
+                    wg = cpdf.reshape(_ng, xdep_src_bin)
+                    xg = x1_interp.reshape(_ng, xdep_src_bin)
+                    vg = (sig_i**2).reshape(_ng, xdep_src_bin)
+                    w_g = jnp.sum(wg, axis=1)
+                    # a group with negligible weight (far tail of the pdf, where the
+                    # weighted sums underflow) contributes nothing; it keeps its
+                    # central position and mean width so that no 0/0 is formed
+                    w_ok = w_g > 1e-200 * jnp.max(w_g)
+                    w_safe = jnp.where(w_ok, w_g, 1.)
+                    x_g = jnp.where(w_ok, jnp.sum(wg * xg, axis=1) / w_safe, jnp.mean(xg, axis=1))
+                    v_g = jnp.where(w_ok,
+                                    jnp.sum(wg * (vg + (xg - x_g[:, None])**2), axis=1) / w_safe,
+                                    jnp.mean(vg, axis=1))
+                    x_src = x_g
+                    sig_src = jnp.sqrt(v_g)
+                    src = jnp.where(w_ok, w_g / sig_src, 0.)
+                else:
+                    x_src = x1_interp
+                    sig_src = sig_i
+                    src = cpdf / sig_i
+                n_ch = -(-n_points_stacked // xdep_chunk)
+                y_pad = jnp.concatenate([
+                    x1_interp,
+                    jnp.full((n_ch * xdep_chunk - n_points_stacked,), x1_interp[-1])])
+
+                def _rows(y_c):
+                    K = jnp.exp(-0.5 * ((y_c[:, None] - x_src[None, :])
+                                        / sig_src[None, :])**2)
+                    return K @ src
+
+                cpdf_x = jax.lax.map(_rows, y_pad.reshape(n_ch, xdep_chunk)
+                                     ).reshape(-1)[:n_points_stacked]
+                # same convention as the stationary path: no scatter applied
+                # when the width is not above sigma_scatter_min
+                cpdf = jnp.where(jnp.min(sig_i) > sigma_scatter_min, cpdf_x, cpdf)
+            else:
+                cpdf = convolve_1d(x1_interp, cpdf, sigma=sigma_scatter_0,
+                                    sigma_min=sigma_scatter_min)
             x0 = x1_interp
 
             norm2 = simpson(cpdf, x=x0)
@@ -1099,10 +1176,16 @@ class cluster_number_counts:
                             f"(got {_sr_o.get_n_layers()} for {_o})")
                     if self.cnc_params.get("stacked_likelihood", False):
                         for _key in self.cnc_params.get("stacked_data", []):
-                            if self.catalogue.stacked_data[_key]["observable"] == _o:
+                            _nls = (int(_sr_o.get_n_layers_stacked())
+                                    if hasattr(_sr_o, "get_n_layers_stacked") else 1)
+                            if (self.catalogue.stacked_data[_key]["observable"] == _o
+                                    and _nls != 2):
+                                # the stacked path applies the layer-0 scatter to the
+                                # mass pdf only when n_layers_stacked == 2
                                 raise NotImplementedError(
                                     "mass_dep_scatter=True: the stacked-likelihood path "
-                                    f"does not support x-dependent scatter for {_o}")
+                                    "supports x-dependent scatter only for observables with "
+                                    f"n_layers_stacked == 2 (got {_nls} for {_o})")
             if _n_declared == 0:
                 raise NotImplementedError(
                     "mass_dep_scatter=True but the survey scatter class declares "
@@ -1763,6 +1846,7 @@ class cluster_number_counts:
 
         # ── 7. Stacked kernel functions ──
         self._stacked_kernels = {}
+        self._stacked_xdep = {}
         if self.cnc_params.get("stacked_likelihood", False):
             for key in self.cnc_params.get("stacked_data", []):
                 stacked_obs = self.catalogue.stacked_data[key]["observable"]
@@ -1772,8 +1856,17 @@ class cluster_number_counts:
                     if mean_fn is not None:
                         layer0_fn_st = sr_st.get_layer_fn(0)
                         layer0_aux_st = sr_st.get_layer_returns_aux(0)
+                        # x-dependent layer-0 scatter in the stacked kernel: same gate
+                        # as the per-cluster backward convolution
+                        _xdep_st = bool(self._xdep_scatter_on
+                                        and sr_st.get_n_layers() >= 2
+                                        and self.scatter.x_dep_scatter(stacked_obs, stacked_obs, 0))
+                        self._stacked_xdep[stacked_obs] = _xdep_st
                         self._stacked_kernels[stacked_obs] = build_stacked_kernel(
-                            layer0_fn_st, mean_fn, layer0_returns_aux=layer0_aux_st)
+                            layer0_fn_st, mean_fn, layer0_returns_aux=layer0_aux_st,
+                            xdep_scatter_layer0=_xdep_st,
+                            xdep_chunk=int(self.cnc_params.get("stacked_xdep_chunk", 256)),
+                            xdep_src_bin=int(self.cnc_params.get("stacked_xdep_src_bin", 1)))
 
     #Updates parameter values (cosmological and scaling relation)
 
@@ -3160,7 +3253,7 @@ class cluster_number_counts:
         def _stacked_one(cpdf_wh, lnM, patch_idx_c,
                           mfn_pc_tuple, l0_pc_tuple, pref_tuple,
                           layer0_sr_patched, mean_fn_sr_shared_patched,
-                          scatter_sigma_c):
+                          scatter_sigma_c, sigma_x_c, lnM_ref):
             l0_shared = tuple(p[patch_idx_c] for p in layer0_sr_patched)
             mfn_shared = tuple(p[patch_idx_c]
                                 for p in mean_fn_sr_shared_patched)
@@ -3172,7 +3265,8 @@ class cluster_number_counts:
                                    layer0_args, mean_pref_args, mean_sr_args,
                                    scatter_sigma_c, sigma_scatter_min,
                                    n_points_stacked, compute_stacked_cov,
-                                   n_layers_stacked, compute_full_cov)
+                                   n_layers_stacked, compute_full_cov,
+                                   sigma_x_c, lnM_ref)
 
         # JAX vmap with in_axes=0 on a tuple pytree applies axis 0 to every
         # leaf; in_axes=None broadcasts the whole pytree. scatter_sigma_c is
@@ -3183,7 +3277,10 @@ class cluster_number_counts:
         # For observables whose σ is z-independent, get_cov returns a scalar
         # which the orchestrator broadcasts to (n_st,); for z-dependent ones
         # (e.g. shear_des_y3), it returns the vector natively.
-        in_axes = (0, 0, 0, 0, 0, 0, None, None, 0)
+        # sigma_x_c: per-cluster row of the x-dependent scatter table
+        # ((n_st, n_ref); a (n_st, 1) dummy when the kernel is stationary),
+        # lnM_ref: its shared mass grid.
+        in_axes = (0, 0, 0, 0, 0, 0, None, None, 0, 0, None)
         return jax.jit(jax.vmap(_stacked_one, in_axes=in_axes))
 
     #Computes the stacked likelihood. Must be called after the unbinned likelihood has been computed.
@@ -3313,6 +3410,22 @@ class cluster_number_counts:
                 np.sqrt(np.broadcast_to(cov_per_cluster_np, (n_clusters,))),
                 dtype=jnp.float64)
 
+            # x-dependent layer-0 scatter: the (n_st, n_ref) table sigma(lnM, z_cluster)
+            # on the abundance log-M grid, from the same scatter.get_std_x call as the
+            # per-cluster backward convolution; a dummy otherwise (ignored at trace time).
+            lnM_ref_st = jnp.asarray(self.ln_M, dtype=jnp.float64)
+            if self._stacked_xdep.get(stacked_observable, False) and n_layers_stacked > 1:
+                sigma_x_st = jnp.asarray(self.scatter.get_std_x(
+                    observable1=stacked_observable, observable2=stacked_observable,
+                    layer=0, lnM=np.asarray(self.ln_M, dtype=np.float64),
+                    other_params={"zc": zc_st_np,
+                                  "h": to_float(self.cosmology.cosmo_params["h"])}),
+                    dtype=jnp.float64)
+                assert sigma_x_st.shape == (n_clusters, len(self.ln_M)), (
+                    f"get_std_x must return (n_stacked, n_lnM); got {sigma_x_st.shape}")
+            else:
+                sigma_x_st = jnp.zeros((n_clusters, 1), dtype=jnp.float64)
+
             if hasattr(stacked_sr, "get_mean_fn_sr_params_per_cluster"):
                 _mfn_pc_full = stacked_sr.get_mean_fn_sr_params_per_cluster(
                     self.scal_rel_params)
@@ -3354,7 +3467,9 @@ class cluster_number_counts:
             # compiled XLA program is reused.
             wrapper_key = (stacked_observable, n_mfn_pc, n_l0_pc, n_pref,
                            n_layers_stacked, n_points_stacked,
-                           compute_stacked_cov, compute_full_cov)
+                           compute_stacked_cov, compute_full_cov,
+                           bool(self._stacked_xdep.get(stacked_observable, False)),
+                           int(self.cnc_params.get("stacked_xdep_src_bin", 1)))
             wrapper = self._stacked_wrappers.get(wrapper_key)
             if wrapper is None:
                 wrapper = self._build_stacked_wrapper(
@@ -3371,13 +3486,13 @@ class cluster_number_counts:
                     cpdf_st, lnM_st, patch_st,
                     mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
                     layer0_sr_patched, mean_fn_sr_shared_patched,
-                    scatter_sigma_per_cluster)
+                    scatter_sigma_per_cluster, sigma_x_st, lnM_ref_st)
             else:
                 obs_means, obs_vars = wrapper(
                     cpdf_st, lnM_st, patch_st,
                     mean_fn_sr_per_cluster, layer0_sr_per_cluster, pref_st_flat,
                     layer0_sr_patched, mean_fn_sr_shared_patched,
-                    scatter_sigma_per_cluster)
+                    scatter_sigma_per_cluster, sigma_x_st, lnM_ref_st)
 
             # Per-cluster predictions (shape (n_stacked_clusters, *obs_shape))
             # are saved so external diagnostics can stratify the stacked

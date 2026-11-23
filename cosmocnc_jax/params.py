@@ -118,6 +118,8 @@ cnc_params_default = {
     "cosmo_param_density": "critical", #"physical" or "critical"
     "scalrel_type_deriv": "analytical", #"analytical" or "numerical"
     "sigma_scatter_min": 1e-5,
+    "stacked_xdep_chunk": 256, # stacked likelihood with x-dependent layer-0 scatter (mass_dep_scatter): output points per step of the direct sum
+    "stacked_xdep_src_bin": 1, # same: source points of the layer-0 grid merged in groups of this size (moments matched to second order); 1 = every point; must divide n_points
     "interp_tinker": "linear", #"linear" or "log", only if "hmf_calc"=="cnc"
 
     "cosmo_model": "lcdm",
