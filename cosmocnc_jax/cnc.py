@@ -10,6 +10,7 @@ from .sr import *
 from .cat import *
 from .params import *
 from .utils import *
+import jax.scipy.special
 from .tracing import is_traced, to_float
 import logging
 import time
@@ -787,7 +788,9 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                             layer_returns_aux_list, layer_deriv_uses_aux_list,
                             n_layers, n_points,
                             direct_final_conv=False, direct_chunk=128,
-                            xdep_scatter_layer0=False):
+                            xdep_scatter_layer0=False,
+                            xdep_fast=False, xdep_src_bin=8, xdep_out_stride=1,
+                            xdep_estimate_only=False, xdep_chunk=64):
     """Factory: build an N-layer abundance kernel for one redshift slice.
 
     Layer functions are captured in the closure (constant across MCMC).
@@ -835,6 +838,40 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             pre-2026-08-29 code. VALIDITY: sigma must be genuine scatter
             resolved by the grid (floored at sigma_scatter_min as a guard).
             Uses direct_chunk for the lax.scan chunking.
+        xdep_fast: STATIC bool (closure). Only with xdep_scatter_layer0. The
+            same layer-0 integral evaluated at reduced cost; the kernel then
+            returns (abundance, err), err a scalar error estimate that the
+            caller compares with a tolerance to decide which setting to use
+            (see xdep_estimate_only). Two reductions:
+            (1) sources: consecutive mass points are merged in groups of
+                xdep_src_bin. A group is represented by the Gaussian with its
+                total weight M, weighted mean position X and total variance V
+                (weighted mean of sigma_j^2 plus the spread of the positions),
+                times a polynomial: the exact expansion
+                    sum_j m_j N(y - x_j; v_j) = sum_n C_n d^n/dy^n N(y - X; V)
+                (shift = -d/dy, variance = half the second derivative), of
+                which the orders n = 3 ... 8 are kept (C_1 = C_2 = 0 by the
+                choice of X and V). With the group width and the variation of
+                sigma across the group both of first order in the group size,
+                order n is of order ceil(n / 2) in the group size.
+            (2) outputs: with xdep_out_stride > 1 the sum is evaluated on
+                every xdep_out_stride-th point of the output grid (plus 4
+                coarse points on each side) and the other points are obtained
+                by 8-point Lagrange interpolation between the coarse values
+                (local; error about 0.11 (h_coarse / sigma)^8 for a Gaussian
+                of width sigma). xdep_out_stride = 1: every point, no
+                interpolation.
+            err = weight-averaged size of the last orders kept (7 and 8),
+            relative to the group's peak, plus (stride > 1) the
+            weight-averaged interpolation term.
+        xdep_src_bin, xdep_out_stride: STATIC ints, must divide n_points.
+        xdep_chunk: STATIC int, number of output points per step of the
+            lax.scan that evaluates the sum (the output count is padded up to
+            a multiple of it; the extra points are discarded).
+        xdep_estimate_only: STATIC bool. With xdep_fast: the kernel returns
+            err alone, without evaluating the integral (the group sums only),
+            so that the caller can choose among several (xdep_src_bin,
+            xdep_out_stride) settings before computing anything.
 
     Returns:
         abundance_one_z(hmf_row, ln_M, obs_select_vec,
@@ -855,6 +892,21 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
     if direct_final_conv or xdep_scatter_layer0:
         assert n_points % direct_chunk == 0, (
             f"direct_chunk={direct_chunk} must divide n_points={n_points}")
+    if xdep_fast:
+        assert xdep_scatter_layer0, "xdep_fast requires xdep_scatter_layer0"
+        assert n_points % xdep_src_bin == 0 and n_points % xdep_out_stride == 0, (
+            f"xdep_src_bin={xdep_src_bin} and xdep_out_stride={xdep_out_stride} must divide n_points={n_points}")
+        _n_src_b = n_points // xdep_src_bin
+        _n_c = n_points // xdep_out_stride + 8
+        _c_chunk = int(xdep_chunk)
+        _n_c_pad = -(-_n_c // _c_chunk) * _c_chunk     # padded up to a multiple of the scan step
+        # 8-point Lagrange weights at the offsets r / stride, r = 0 ... stride - 1, for nodes
+        # at -3 ... 4 coarse cells from the coarse point just below
+        _t = np.arange(xdep_out_stride, dtype=np.float64) / xdep_out_stride
+        _nod = np.arange(-3, 5, dtype=np.float64)
+        _lag_w = jnp.asarray(np.stack([
+            np.prod([(_t - _nod[jj]) / (_nod[kk] - _nod[jj]) for jj in range(8) if jj != kk], axis=0)
+            for kk in range(8)], axis=1))                                   # (stride, 8)
 
     def abundance_one_z(hmf_row, ln_M, obs_select_vec,
                         all_layer_args, all_deriv_args,
@@ -862,6 +914,7 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                         sigma_scatter_min, skyfrac, pad_abundance, sigma_x_l0):
         x0 = ln_M
         dn_dx0 = hmf_row
+        xdep_err = jnp.zeros((), dtype=jnp.float64)
 
         for k in range(n_layers):
             layer_fn = layer_fns[k]
@@ -937,6 +990,80 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                 y_max = jnp.max(x1) + pad
                 y_grid = jnp.linspace(y_min, y_max, n_points)
 
+                if xdep_fast:
+                    # (1) groups of consecutive sources -> one Gaussian each
+                    # (same weight, mean and variance as the group)
+                    mb = (integrand * w).reshape(_n_src_b, xdep_src_bin)
+                    xb = x1.reshape(_n_src_b, xdep_src_bin)
+                    vb = (sig**2).reshape(_n_src_b, xdep_src_bin)
+                    M_b = jnp.sum(mb, axis=1)
+                    has = M_b > 0.
+                    M_safe = jnp.where(has, M_b, 1.)
+                    X_b = jnp.where(has, jnp.sum(mb * xb, axis=1) / M_safe, jnp.mean(xb, axis=1))
+                    d_b = xb - X_b[:, None]
+                    V_b = jnp.where(has, jnp.sum(mb * (vb + d_b**2), axis=1) / M_safe, jnp.mean(vb, axis=1))
+                    S_b = jnp.sqrt(V_b)
+                    # exact expansion of the group about its merged Gaussian:
+                    #   sum_j m_j N(y - x_j; v_j) = sum_n C_n d^n/dy^n N(y - X; V),
+                    #   C_n = sum_j m_j sum_{p + 2q = n} (-d_j)^p / p! (e_j / 2)^q / q!,
+                    # d_j = x_j - X, e_j = v_j - V (shift: -d/dy; variance: the heat
+                    # equation dN/dv = N'' / 2). C_0 = M, C_1 = C_2 = 0 by the choice
+                    # of X and V; orders 3 to 8 kept, in Hermite form:
+                    #   N(u) / S * [M + sum_n t_n He_n(u)], t_n = (-1)^n C_n / S^n.
+                    e_b = jnp.where(has[:, None], vb - V_b[:, None], 0.)
+                    dd = jnp.where(has[:, None], d_b, 0.)
+                    t3 = -jnp.sum(mb * (-dd**3 / 6. - dd * e_b / 2.), axis=1) / S_b**3
+                    t4 = jnp.sum(mb * (dd**4 / 24. + dd**2 * e_b / 4. + e_b**2 / 8.), axis=1) / S_b**4
+                    t5 = -jnp.sum(mb * (-dd**5 / 120. - dd**3 * e_b / 12. - dd * e_b**2 / 8.), axis=1) / S_b**5
+                    t6 = jnp.sum(mb * (dd**6 / 720. + dd**4 * e_b / 48. + dd**2 * e_b**2 / 16. + e_b**3 / 48.), axis=1) / S_b**6
+                    t7 = -jnp.sum(mb * (-dd**7 / 5040. - dd**5 * e_b / 240. - dd**3 * e_b**2 / 48. - dd * e_b**3 / 48.), axis=1) / S_b**7
+                    t8 = jnp.sum(mb * (dd**8 / 40320. + dd**6 * e_b / 1440. + dd**4 * e_b**2 / 192.
+                                       + dd**2 * e_b**3 / 96. + e_b**4 / 384.), axis=1) / S_b**8
+                    # monomial coefficients in u of M + t3 He3 + ... + t8 He8,
+                    # times 1 / (sqrt(2 pi) S)
+                    _nrm = 1. / (jnp.sqrt(2. * jnp.pi) * S_b)
+                    a0 = (M_b + 3. * t4 - 15. * t6 + 105. * t8) * _nrm
+                    a1 = (-3. * t3 + 15. * t5 - 105. * t7) * _nrm
+                    a2 = (-6. * t4 + 45. * t6 - 420. * t8) * _nrm
+                    a3 = (t3 - 10. * t5 + 105. * t7) * _nrm
+                    a4 = (t4 - 15. * t6 + 210. * t8) * _nrm
+                    a5 = (t5 - 21. * t7) * _nrm
+                    a6 = (t6 - 28. * t8) * _nrm
+                    a7 = t7 * _nrm
+                    a8 = t8 * _nrm
+                    inv_s_b = 1. / S_b
+                    # (2) coarse output grid: every xdep_out_stride-th point of
+                    # y_grid, 4 more on each side (the stencil of the 8-point
+                    # interpolation)
+                    dy = (y_max - y_min) / (n_points - 1)
+                    h_c = xdep_out_stride * dy
+                    y_c = y_min + (jnp.arange(_n_c_pad, dtype=jnp.float64) - 4.) * h_c
+
+                    # error estimate (see the factory docstring)
+                    M_tot = jnp.maximum(jnp.sum(M_b), 1e-300)
+                    e_trunc = jnp.sum(35.6 * jnp.abs(t7) + 105. * jnp.abs(t8)) / M_tot
+                    e_interp = (0.112 * jnp.sum(M_b * (h_c * inv_s_b)**8) / M_tot) if xdep_out_stride > 1 else 0.
+                    xdep_err = e_trunc + e_interp
+                    if xdep_estimate_only:
+                        return xdep_err
+
+                    def _chunk_c(carry, y_chunk):
+                        u = (y_chunk[:, None] - X_b[None, :]) * inv_s_b[None, :]
+                        pol = a0 + u * (a1 + u * (a2 + u * (a3 + u * (a4 + u * (a5 + u * (a6 + u * (a7 + u * a8)))))))
+                        return carry, jnp.sum(jnp.exp(-0.5 * u * u) * pol, axis=1)
+
+                    _, out_c = jax.lax.scan(_chunk_c, 0., y_c.reshape(-1, _c_chunk))
+                    out_c = out_c.reshape(-1)
+                    # 8-point Lagrange interpolation to the points of y_grid:
+                    # fine point m * stride + r sits r / stride of a coarse
+                    # cell above coarse point m + 4; nodes m + 1 ... m + 8
+                    _n_m = n_points // xdep_out_stride
+                    nodes = jnp.stack([out_c[1 + kk:1 + kk + _n_m] for kk in range(8)], axis=1)   # (n_m, 8)
+                    out = jnp.maximum((nodes @ _lag_w.T).reshape(-1), 0.)
+                    x0 = y_grid
+                    dn_dx0 = out
+                    continue
+
                 def _chunk_l0(carry, y_chunk):
                     K = jnp.exp(-inv2s2[None, :] * (y_chunk[:, None] - x1[None, :])**2)
                     return carry, K @ v
@@ -995,6 +1122,8 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
         # Final: interpolate to obs_select_vec (x0 is uniform here — the layer
         # loop's linspace grid, or the log-M grid when n_layers == 0)
         abundance = interp_from_uniform_grid(obs_select_vec, x0, dn_dx0, left=0.) * 4. * jnp.pi * skyfrac
+        if xdep_fast:
+            return abundance, xdep_err
         return abundance
 
     return abundance_one_z
@@ -1795,6 +1924,42 @@ class cluster_number_counts:
         # the assembled tensor (the same expressions as in compute above).
         self._jit_abundance_tensor = jax.jit(abundance_vmap_pz)
 
+        # Reduced-cost evaluation of the x-dependent layer-0 integral (xdep_abundance_fast,
+        # default off; see build_abundance_kernel). Compiled next to the standard kernel,
+        # which stays the reference: for each group of patches the estimates of the settings
+        # are obtained first (no integral evaluated) and the first setting within
+        # xdep_abundance_tol is used; the standard kernel only when none is.
+        self._xdep_fast = bool(self._xdep_abundance and self.cnc_params.get("xdep_abundance_fast", False))
+        self._xdep_level_counts = []
+        self._xdep_fast_calls = 0
+        self._xdep_fast_fallbacks = 0
+        self._xdep_fast_max_err = 0.
+        if self._xdep_fast:
+            self._xdep_fast_tol = float(self.cnc_params.get("xdep_abundance_tol", 1e-7))
+            # Settings in the order they are tried: the first, then those of xdep_abundance_refine
+            # (pairs [src_bin, out_stride], finer and costlier). For each: the compiled kernel and
+            # its estimate-only twin. Compiled on first use.
+            _levels = [(int(self.cnc_params.get("xdep_abundance_src_bin", 8)),
+                        int(self.cnc_params.get("xdep_abundance_out_stride", 1)))]
+            for _lv in (self.cnc_params.get("xdep_abundance_refine", None) or []):
+                _levels.append((int(_lv[0]), int(_lv[1])))
+            self._xdep_levels = _levels
+            self._xdep_level_counts = [0] * (len(_levels) + 1)   # last entry: standard kernel
+
+            def _xdep_jit(_bin, _stride, _est_only):
+                _k = build_abundance_kernel(
+                    layer_fns_sel, layer_deriv_fns_sel,
+                    layer_returns_aux_sel, layer_deriv_uses_aux_sel,
+                    n_layers_sel, n_points_abund,
+                    direct_final_conv=bool(self.cnc_params.get("obs_select_conv_direct", False)),
+                    direct_chunk=int(self.cnc_params.get("obs_select_conv_chunk", 128)),
+                    xdep_scatter_layer0=True, xdep_fast=True,
+                    xdep_src_bin=_bin, xdep_out_stride=_stride, xdep_estimate_only=_est_only,
+                    xdep_chunk=int(self.cnc_params.get("xdep_abundance_chunk", 64)))
+                return jax.jit(jax.vmap(jax.vmap(_k, in_axes=z_vmap_in_axes), in_axes=p_vmap_in_axes))
+            self._jit_xdep_tensor = [_xdep_jit(_b, _s, False) for _b, _s in _levels]
+            self._jit_xdep_estimate = [_xdep_jit(_b, _s, True) for _b, _s in _levels]
+
         @jax.jit
         def _abundance_integrals(abundance_tensor, hmf_matrix, ln_M, obs_select_vec,
                                  redshift_vec, total_skyfrac):
@@ -2358,7 +2523,43 @@ class cluster_number_counts:
         if is_traced(self.hmf_matrix):
             n_groups = 1   # inside a whole-evaluation trace: one call (threads are a host-level construct)
 
-        if n_groups <= 1:
+        # reduced-cost x-dependent kernel: host-level check of its error estimate, so not
+        # inside a whole-evaluation trace
+        use_xdep_fast = self._xdep_fast and not is_traced(self.hmf_matrix)
+
+        def _tensor_checked(la, da, sc, sf, sx):
+            args = (self.hmf_matrix, self.ln_M, self.obs_select_vec,
+                    la, da, sc, all_cutoff_vals, all_apply_cutoffs,
+                    sigma_scatter_min, sf, pad_abundance, sx)
+            self._xdep_fast_calls += 1
+            out = None
+            # the first setting whose estimate (group sums only, no integral) is within the
+            # tolerance; a NaN estimate fails every comparison
+            for i_lv in range(len(self._xdep_levels)):
+                e = float(jnp.max(self._jit_xdep_estimate[i_lv](*args)))
+                if e <= self._xdep_fast_tol:
+                    out, _ = self._jit_xdep_tensor[i_lv](*args)
+                    self._xdep_level_counts[i_lv] += 1
+                    self._xdep_fast_max_err = max(self._xdep_fast_max_err, e)
+                    break
+            if out is None:
+                self._xdep_fast_fallbacks += 1
+                self._xdep_level_counts[-1] += 1
+                out = self._jit_abundance_tensor(*args)
+            out.block_until_ready()
+            return out
+
+        if n_groups <= 1 and use_xdep_fast:
+
+            tensor = _tensor_checked(all_layer_args_patched, all_deriv_args_patched,
+                                     all_scatters, skyfracs_arr, sigma_x_l0)
+            (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
+             abundance_matrix_out, n_z_vec_out, n_tot_out,
+             self.dndz_hmf, self.n_tot_hmf) = self._jit_abundance_integrals(
+                tensor, self.hmf_matrix, self.ln_M, self.obs_select_vec,
+                self.redshift_vec, total_skyfrac)
+
+        elif n_groups <= 1:
 
             (self.abundance_tensor, self.n_obs_matrix, self.n_tot_vec,
              abundance_matrix_out, n_z_vec_out, n_tot_out,
@@ -2387,6 +2588,8 @@ class cluster_number_counts:
 
             def _one_group(sl):
                 la, da, sc, sf, sx = jax.tree_util.tree_map(lambda a: a[sl], per_patch)
+                if use_xdep_fast:
+                    return _tensor_checked(la, da, sc, sf, sx)
                 out = self._jit_abundance_tensor(
                     self.hmf_matrix, self.ln_M, self.obs_select_vec,
                     la, da, sc, all_cutoff_vals, all_apply_cutoffs,

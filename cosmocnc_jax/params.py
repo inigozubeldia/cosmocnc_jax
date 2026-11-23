@@ -39,6 +39,23 @@ cnc_params_default = {
     # quadrature at the abundance layer 0 and the 1D backward conv. Guards: selection
     # observable must be 2-layer and sit in a 1-observable correlation set.
     "mass_dep_scatter": False,
+    # Reduced-cost evaluation of the abundance layer-0 integral when the selection observable's
+    # scatter is x-dependent (mass_dep_scatter): sources merged in groups of xdep_abundance_src_bin
+    # mass points (each group = its moment-matched Gaussian times the group's exact expansion to
+    # order 8); with xdep_abundance_out_stride > 1 the outputs are evaluated on every
+    # xdep_abundance_out_stride-th grid point and interpolated in between (8-point Lagrange).
+    # The setting is used when its error estimate is within xdep_abundance_tol (see
+    # xdep_abundance_refine below). Default off. See build_abundance_kernel in cnc.py.
+    "xdep_abundance_fast": False,
+    "xdep_abundance_src_bin": 8,
+    "xdep_abundance_out_stride": 1,
+    "xdep_abundance_tol": 1e-7,
+    # Further [src_bin, out_stride] settings, finer and costlier, tried in order when the estimate of
+    # the first exceeds the tolerance (e.g. [[4, 2], [2, 1]]); the estimate of a setting is obtained
+    # from the group sums alone, before any integral is evaluated. The standard quadrature is used
+    # only when no setting passes.
+    "xdep_abundance_refine": None,
+    "xdep_abundance_chunk": 64,   # output points per lax.scan step of the reduced-cost sum (speed only)
     # Catalogue simulator only (sim.py): layer-0 intrinsic scatter of the observables for which the
     # survey scatter class declares x_dep_scatter taken from get_std_x at each simulated cluster's own
     # (ln M, z). Default False = the covariance from get_cov. Independent of "mass_dep_scatter" (the
