@@ -56,6 +56,11 @@ cnc_params_default = {
     # only when no setting passes.
     "xdep_abundance_refine": None,
     "xdep_abundance_chunk": 64,   # output points per lax.scan step of the reduced-cost sum (speed only)
+    # Backward convolution of a 2-observable correlation set with x-dependent layer-0 scatter (mass_dep_scatter;
+    # build_2d_xdep_conv_fn in cnc.py): the per-cluster result is evaluated at every bc_xdep_2obs_mass_stride-th
+    # mass point and interpolated (6-point Lagrange in the mass index, of the logarithm): faster, less accurate;
+    # 1 (default) = every mass point.
+    "bc_xdep_2obs_mass_stride": 1,
     # Catalogue simulator only (sim.py): layer-0 intrinsic scatter of the observables for which the
     # survey scatter class declares x_dep_scatter taken from get_std_x at each simulated cluster's own
     # (ln M, z). Default False = the covariance from get_cov. Independent of "mass_dep_scatter" (the

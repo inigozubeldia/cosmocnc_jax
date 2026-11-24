@@ -25,7 +25,7 @@ _CNC_PARAM_KEYS = (
     "nd_convolution_mode",
     "obs_select_conv_direct", "obs_select_conv_chunk",   # [direct-conv 2026-08-27]
     "mass_dep_scatter",   # [mass-dep scatter 2026-08-29] gated sigma(M, z) layer-0 scatter
-    "xdep_abundance_fast", "xdep_abundance_src_bin", "xdep_abundance_out_stride", "xdep_abundance_tol", "xdep_abundance_refine", "xdep_abundance_chunk",
+    "xdep_abundance_fast", "xdep_abundance_src_bin", "xdep_abundance_out_stride", "xdep_abundance_tol", "xdep_abundance_refine", "xdep_abundance_chunk", "bc_xdep_2obs_mass_stride",
     # observables / catalogue
     "load_catalogue", "precompute_cnc_quantities_catalogue", "likelihood_type",
     "obs_select", "observables", "observables_mass_estimation", "n_points_mass_estimation",
@@ -297,6 +297,7 @@ class cnc(classy):
     xdep_abundance_tol: Optional[float] = 1e-7
     xdep_abundance_refine: Optional[list] = None
     xdep_abundance_chunk: Optional[int] = 64
+    bc_xdep_2obs_mass_stride: Optional[int] = 1
     bc_chunk_size: Optional[int] = 2000
     abundance_patch_threads: Optional[int] = 1
     bc_cluster_threads: Optional[int] = 1
@@ -460,7 +461,8 @@ class cnc(classy):
         for _key in ("n_points", "n_obs_select", "n_z", "downsample_hmf_bc",
                      "n_points_data_lik", "bc_chunk_size", "abundance_patch_threads", "bc_cluster_threads", "n_z_error_integral",
                      "obs_select_conv_chunk",
-                     "xdep_abundance_src_bin", "xdep_abundance_out_stride", "xdep_abundance_chunk"):
+                     "xdep_abundance_src_bin", "xdep_abundance_out_stride", "xdep_abundance_chunk",
+                     "bc_xdep_2obs_mass_stride"):
             self.cnc.cnc_params[_key] = int(self.cnc.cnc_params[_key])
         for _key in ("M_min", "M_max", "camb_accuracy_boost"):
             self.cnc.cnc_params[_key] = float(self.cnc.cnc_params[_key])

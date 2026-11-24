@@ -509,9 +509,192 @@ def build_2d_conv_fn(n_pts, nd_circular=True):
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
 
 
+def _lagrange6(t):
+    """Weights of the 6-point Lagrange interpolation at offset t from the first of six
+    equally spaced nodes (nodes at 0 ... 5). t: (...,) -> (..., 6)."""
+    ws = []
+    for k in range(6):
+        w = 1.
+        for j in range(6):
+            if j != k:
+                w = w * (t - j) / (k - j)
+        ws.append(w)
+    return jnp.stack(ws, axis=-1)
+
+
+def build_2d_xdep_conv_fn(n_pts, a_xdep, b_xdep, n_nodes=16, i_batch=32, i_stride=1):
+    """Factory: second stage of the backward convolution of a 2-observable correlation
+    set whose layer-0 scatter depends on the mass point (x-dependent widths of one or
+    both observables, with a correlation coefficient rho).
+
+    Valid when the layer-1 covariance of the two observables is diagonal, so that the
+    layer-1 pdf is a product p_a(x_a) p_b(x_b). The correlated layer-0 Gaussian then
+    factorises: with D one observable and T the other,
+        N2 = N(d_D; s_D) N(d_T - rho (s_T / s_D) d_D; s_T sqrt(1 - rho^2)),
+    and the value at mass point i (layer-0 means X_D, X_T, widths s_D, s_T there) is
+
+        I_i = sum_l p_D(x_l) N(X_D - x_l; s_D) F(X_T - rho (s_T / s_D) (X_D - x_l); s_T sqrt(1 - rho^2)),
+
+    F(y; s) = the layer-1 pdf of T convolved with a Gaussian of width s, tabulated on
+    the (zero-padded) grid of T by FFT. D ("direct") is an observable WITH x-dependent
+    scatter: b if only b has it, a otherwise. T ("tabulated") is the other one:
+      - T without x-dependent scatter: s is the same at every mass point, F is ONE
+        convolution;
+      - T with x-dependent scatter (both observables have it): F at n_nodes widths,
+        log-spaced between the smallest and the largest needed, 6-point Lagrange in
+        ln s.
+    F is looked up by 6-point Lagrange. For T WITHOUT x-dependent scatter the result is
+    obtained with T at the two grid points bracketing its mean and interpolated
+    linearly: the scheme of the stationary 1-observable path (convolution on the grid,
+    then linear interpolation to the mean), kept at every rho, so that the 2-observable
+    set carries the same interpolation convention as the separate sets and as the
+    stationary 2D path. Gaussian weights are normalised by the full-window kernel sum
+    on the observable's own grid. rho = 0 then gives the product of the two
+    1-observable backward convolutions as the separate sets evaluate them.
+    Cost per cluster: n_pts^2 kernel evaluations and table look-ups (n_pts^3 for the
+    direct double sum).
+
+    i_stride > 1: the result is evaluated at every i_stride-th mass point (and at the
+    points after the last of those) and interpolated (6-point Lagrange in the mass
+    index, of the logarithm where the stencil values are positive); it trades accuracy
+    for time; 1 (default) = every mass point.
+
+    a_xdep, b_xdep: STATIC bools, whether observable a (index 0, the one carrying the
+    observable cutoff) / b (index 1) has x-dependent layer-0 scatter (at least one).
+    """
+    assert a_xdep or b_xdep
+    swap = bool(b_xdep and not a_xdep)        # D = b, T = a
+    t_xdep = bool(a_xdep and b_xdep)          # T has x-dependent scatter only when both have
+    n_pad = n_pts // 2
+    n_big = n_pts + 2 * n_pad
+    assert n_nodes >= 6
+    # mass points evaluated: every i_stride-th one, plus the points after the last of those
+    _idx_c = np.arange(0, n_pts, i_stride)
+    _idx_tail = np.arange(_idx_c[-1] + 1, n_pts)
+    assert i_stride == 1 or len(_idx_c) >= 6
+
+    def per_cluster(mn, mx, r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                    x_lin_0_start, x_lin_1_start, dx0, dx1,
+                    obs_val_0, var1_a, var1_b, rho, sig_a_row, sig_b_row, lnM_ref,
+                    apply_cutoff, cutoff_val, mean_cut_val):
+        lnM = jnp.linspace(mn, mx, n_pts)
+        sa = jnp.maximum(jnp.interp(lnM, lnM_ref, sig_a_row), 1e-30)
+        sb = jnp.maximum(jnp.interp(lnM, lnM_ref, sig_b_row), 1e-30)
+
+        # layer-1 pdfs on the two linear grids (product form); observable cutoff on a
+        p_a = gaussian_1d(r0, jnp.sqrt(var1_a))
+        p_a = jnp.where(apply_cutoff & (r0 + obs_val_0 < cutoff_val), 0., p_a)
+        p_b = gaussian_1d(r1, jnp.sqrt(var1_b))
+
+        if swap:
+            p_D, p_T, X_D, X_T, s_D, s_T = p_b, p_a, x_l0_1, x_l0_0, sb, sa
+            xD0, dxD, kcD, xT0, dxT, kcT = x_lin_1_start, dx1, kc1, x_lin_0_start, dx0, kc0
+        else:
+            p_D, p_T, X_D, X_T, s_D, s_T = p_a, p_b, x_l0_0, x_l0_1, sa, sb
+            xD0, dxD, kcD, xT0, dxT, kcT = x_lin_0_start, dx0, kc0, x_lin_1_start, dx1, kc1
+        x_lin_D = xD0 + dxD * jnp.arange(n_pts, dtype=jnp.float64)
+
+        c = rho * s_T / s_D                                  # shift of T per unit of D
+        s = jnp.maximum(s_T * jnp.sqrt(1. - rho**2), 1e-3 * jnp.abs(dxT))   # conditional width of T
+
+        # F(y; s) on the padded grid of T
+        p_T_pad = jnp.zeros(n_big, dtype=jnp.float64).at[n_pad:n_pad + n_pts].set(p_T)
+        kc_pad = (jnp.arange(n_big, dtype=jnp.float64) - n_big / 2. + 1.) * dxT   # as kcT: x - mean(x) + dx / 2
+
+        def _row(sn):
+            kern = jnp.exp(-0.5 * (kc_pad / sn)**2)
+            # convolve_nd divides by sum(kern); the convention is the kernel sum on T's own grid
+            return (convolve_nd(p_T_pad, kern) * jnp.sum(kern)
+                    / jnp.maximum(jnp.sum(jnp.exp(-0.5 * (kcT / sn)**2)), 1e-300))
+        if t_xdep:
+            ln_s0 = jnp.log(jnp.min(s))
+            dln = jnp.maximum((jnp.log(jnp.max(s)) - ln_s0) / (n_nodes - 1), 1e-12)
+            table = jax.vmap(_row)(jnp.exp(ln_s0 + dln * jnp.arange(n_nodes, dtype=jnp.float64)))   # (n_nodes, n_big)
+        else:
+            row0 = _row(s[0])                                # s is the same at every mass point
+        y0 = xT0 - n_pad * dxT
+
+        def _F(trow, y):
+            v = (y - y0) / dxT
+            inside = (v >= 0.) & (v <= n_big - 1.)
+            l0 = jnp.clip(jnp.floor(v).astype(jnp.int32) - 2, 0, n_big - 6)
+            w = _lagrange6(v - l0)
+            f = jnp.sum(w * trow[l0[:, None] + jnp.arange(6)], axis=-1)
+            return jnp.where(inside, f, 0.)
+
+        def one_i(args):
+            XD_i, XT_i, sD_i, c_i, s_i = args
+            if t_xdep:
+                u = (jnp.log(s_i) - ln_s0) / dln
+                j0 = jnp.clip(jnp.floor(u).astype(jnp.int32) - 2, 0, n_nodes - 6)
+                trow = _lagrange6(u - j0) @ table[j0 + jnp.arange(6)]
+            else:
+                trow = row0
+            S_D = jnp.maximum(jnp.sum(jnp.exp(-0.5 * (kcD / sD_i)**2)), 1e-300)
+            d = XD_i - x_lin_D
+            wD = p_D * jnp.exp(-0.5 * (d / sD_i)**2)
+            if t_xdep:
+                return jnp.sum(wD * _F(trow, XT_i - c_i * d)) / S_D
+            # T without x-dependent scatter: the stationary scheme of the 1-observable path
+            # (value at the grid points of T, then linear interpolation to the mean X_T).
+            # The two grid points g, g + 1 bracketing X_T are one cell apart: the linear
+            # combination (1 - t) F(y) + t F(y + dxT) is ONE look-up in the table blended
+            # with its copy shifted by one cell, (1 - t) T[m] + t T[m + 1]. Index in the
+            # padded table of the point for g: g + n_pad - c d / dxT (an integer when
+            # rho = 0, where the look-up returns the table value itself).
+            fi = jnp.clip((XT_i - xT0) / dxT, 0., n_pts - 1 - 1e-7)
+            g = jnp.clip(jnp.floor(fi).astype(jnp.int32), 0, n_pts - 2)
+            t = fi - g
+            tblend = (1. - t) * trow[:-1] + t * trow[1:]         # (n_big - 1,)
+            v = g + n_pad - c_i * d / dxT
+            inside = (v >= 0.) & (v <= n_big - 2.)
+            l0 = jnp.clip(jnp.floor(v).astype(jnp.int32) - 2, 0, n_big - 7)
+            f = jnp.sum(_lagrange6(v - l0) * tblend[l0[:, None] + jnp.arange(6)], axis=-1)
+            return jnp.sum(wD * jnp.where(inside, f, 0.)) / S_D
+
+        _all = (X_D, X_T, s_D, c, s)
+        if i_stride == 1:
+            cpdf = jax.lax.map(one_i, _all, batch_size=i_batch)
+        else:
+            coarse = jax.lax.map(one_i, tuple(a[_idx_c] for a in _all), batch_size=i_batch)
+            pos = jnp.arange(n_pts, dtype=jnp.float64) / i_stride
+            j0 = jnp.clip(jnp.floor(pos).astype(jnp.int32) - 2, 0, len(_idx_c) - 6)
+            _w = _lagrange6(pos - j0)
+            _st = coarse[j0[:, None] + jnp.arange(6)]
+            _pos = jnp.min(_st, axis=-1) > 1e-250
+            cpdf = jnp.where(_pos, jnp.exp(jnp.sum(_w * jnp.log(jnp.maximum(_st, 1e-300)), axis=-1)),
+                             jnp.sum(_w * _st, axis=-1))
+            if len(_idx_tail) > 0:
+                tail = jax.lax.map(one_i, tuple(a[_idx_tail] for a in _all), batch_size=i_batch)
+                cpdf = cpdf.at[_idx_tail].set(tail)
+        cpdf = jnp.maximum(cpdf, 0.)
+
+        # pre-scatter mass-floor mask on the selection observable (as the other paths)
+        _dxs = jnp.maximum(jnp.abs(jnp.gradient(x_l0_0)), 1e-30)
+        cpdf = cpdf * jnp.clip((x_l0_0 - mean_cut_val) / _dxs + 0.5, 0., 1.)
+        return cpdf
+
+    vmap_in = (
+        0, 0,               # mn, mx
+        0, 0, 0, 0, 0, 0,   # r0, r1, kc0, kc1, x_l0_0, x_l0_1
+        0, 0, 0, 0,         # x_lin_0_start, x_lin_1_start, dx0, dx1
+        0,                  # obs_val_0
+        0, 0, 0,            # var1_a, var1_b, rho (per-cluster)
+        0, 0, None,         # sig_a_row, sig_b_row (n_ref,) per cluster; lnM_ref shared
+        None, None, None,   # apply_cutoff, cutoff_val, mean_cut_val
+    )
+    return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
+
+
 def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
-                     pref_fns, n_psr_list, n_sub, n_pts, nd_circular=True):
+                     pref_fns, n_psr_list, n_sub, n_pts, nd_circular=True,
+                     xdep_scatter_layer0=False):
     """Factory: build vmapped JIT for backward conv of a sub-pattern.
+
+    xdep_scatter_layer0 (n_sub == 1 only): the observable's layer-0 scatter is
+    x-dependent; the compiled function then takes two more arguments, the per-cluster
+    width table sigma_x_row (n_ref,) and its shared mass grid lnM_ref.
+
 
     For a subset of observables within a correlation set, wraps
     build_backward_conv_nd with prefactor computation and vmaps over clusters.
@@ -539,13 +722,14 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
                     cov_l0, cov_l1, apply_cut, cut_val) → cpdf (n_pts,)
     """
     bc_fn = build_backward_conv_nd(
-        layer0_fns, layer1_fns, layer0_returns_aux_list, n_sub, nd_circular)
+        layer0_fns, layer1_fns, layer0_returns_aux_list, n_sub, nd_circular,
+        xdep_scatter_layer0=xdep_scatter_layer0)
 
     def per_cluster(mn, mx, obs_vals, E_z, D_A, D_l_CMB, rho_c,
                     H0, D_CMB, gamma, z_c,
                     all_pref_sr, all_layer0_sr, all_layer1_sr,
                     cov_l0, cov_l1, apply_cut, cut_val, mean_cut_val,
-                    patch_idx):
+                    patch_idx, sigma_x_row=None, lnM_ref=None):
         lnM = jnp.linspace(mn, mx, n_pts)
         layer0_args = []
         layer1_args = []
@@ -557,6 +741,10 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
                                 H0, D_CMB, gamma, z_c, *psr_k)
             layer0_args.append(prefs + l0_k)
             layer1_args.append(prefs + l1_k)
+        if xdep_scatter_layer0:
+            return bc_fn(lnM, obs_vals, tuple(layer0_args), tuple(layer1_args),
+                         cov_l0, cov_l1, n_pts, apply_cut, cut_val, mean_cut_val,
+                         sigma_x_row=sigma_x_row, lnM_ref=lnM_ref)
         return bc_fn(lnM, obs_vals, tuple(layer0_args), tuple(layer1_args),
                      cov_l0, cov_l1, n_pts, apply_cut, cut_val, mean_cut_val)
 
@@ -571,6 +759,8 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
         None, None, None,                                 # apply_cut, cut_val, mean_cut_val
         0,                                                # patch_idx (per-cluster)
     )
+    if xdep_scatter_layer0:
+        vmap_in = vmap_in + (0, None)                     # sigma_x_row (per-cluster), lnM_ref (shared)
     return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in))
 
 
@@ -1318,11 +1508,15 @@ class cluster_number_counts:
                     if _sr_o.get_n_layers() < 2 or not self.scatter.x_dep_scatter(_o, _o, 0):
                         continue
                     _n_declared += 1
-                    if len(_oset) != 1:
+                    if len(_oset) > 2:
                         raise NotImplementedError(
                             f"mass_dep_scatter=True: observable {_o} declares x-dependent "
-                            "layer-0 scatter but is not alone in its correlation set (the "
-                            f">=2D backward conv does not support it); got set {_oset}")
+                            "layer-0 scatter in a correlation set of more than two observables "
+                            f"(supported: alone, or in a 2-observable set); got set {_oset}")
+                    if len(_oset) == 2 and any(self.scaling_relations[_p].get_n_layers() != 2 for _p in _oset):
+                        raise NotImplementedError(
+                            "mass_dep_scatter=True: a 2-observable correlation set with x-dependent "
+                            f"layer-0 scatter needs two 2-layer observables; got set {_oset}")
                     if _sr_o.get_n_layers() != 2:
                         raise NotImplementedError(
                             "mass_dep_scatter supports only 2-layer observables "
@@ -1374,6 +1568,7 @@ class cluster_number_counts:
         self._bc_set_fns = []      # list of (bc_fn, obs_names) per correlation set
         self._bc_set_obs = []      # list of obs_name lists per correlation set
         self._bc_set_xdep = []     # per correlation set: x-dependent layer-0 scatter kernel? [2026-09-08]
+        self._bc_set_xdep2 = []    # per correlation set: (a declares, b declares) for a 2-observable x-dependent set, else None
         self._all_sets_are_1d = True  # fast-path flag
         self._1layer_obs_list = []   # 1-layer observables (direct PDF, no backward conv)
 
@@ -1434,6 +1629,11 @@ class cluster_number_counts:
             self._bc_set_fns.append(bc_set_fn)
             self._bc_set_obs.append(bc_obs_in_set)
             self._bc_set_xdep.append(_xdep_set)
+            # 2-observable set with x-dependent layer-0 scatter of one or both observables:
+            # which of the two declare it (None for every other set)
+            _decl2 = ([bool(self.scatter.x_dep_scatter(_o, _o, 0)) for _o in bc_obs_in_set]
+                      if (self._xdep_scatter_on and n_obs_set == 2) else [False, False])
+            self._bc_set_xdep2.append(tuple(_decl2) if any(_decl2) else None)
 
 
         # ── 2. Mass range function for selection observable ──
@@ -1553,12 +1753,24 @@ class cluster_number_counts:
             if n_obs_s < 2:
                 continue
             full_pat = tuple(range(n_obs_s))
-            # Full pattern → reference to existing 2D split-JIT
-            self._sub_bc_jits[(s_idx, full_pat)] = {
-                'type': '2d_split',
-                'fwd_jit': self._2d_forward_jits[s_idx],
-                'conv_jit': self._2d_conv_jits[s_idx],
-            }
+            _decl2 = self._bc_set_xdep2[s_idx]
+            if _decl2 is not None:
+                # 2-observable set with x-dependent layer-0 scatter: the same forward stage,
+                # the factorised second stage (build_2d_xdep_conv_fn)
+                self._sub_bc_jits[(s_idx, full_pat)] = {
+                    'type': '2d_xdep',
+                    'fwd_jit': self._2d_forward_jits[s_idx],
+                    'conv_jit': build_2d_xdep_conv_fn(
+                        n_points_dl, _decl2[0], _decl2[1],
+                        i_stride=int(self.cnc_params.get("bc_xdep_2obs_mass_stride", 1))),
+                }
+            else:
+                # Full pattern → reference to existing 2D split-JIT
+                self._sub_bc_jits[(s_idx, full_pat)] = {
+                    'type': '2d_split',
+                    'fwd_jit': self._2d_forward_jits[s_idx],
+                    'conv_jit': self._2d_conv_jits[s_idx],
+                }
             # Enumerate all non-empty proper subsets
             for r in range(1, n_obs_s):
                 for sub_indices in combinations(range(n_obs_s), r):
@@ -1587,11 +1799,13 @@ class cluster_number_counts:
                         }
                     else:
                         # 1D or 3+D: generic wrapper
+                        _sub_xdep = bool(r == 1 and _decl2 is not None and _decl2[sub_indices[0]])
                         jit_fn = build_sub_bc_jit(
                             sub_l0, sub_l1, sub_aux, sub_pref, sub_npsr,
-                            r, n_points_dl, nd_circ)
+                            r, n_points_dl, nd_circ,
+                            xdep_scatter_layer0=_sub_xdep)
                         self._sub_bc_jits[(s_idx, sub_indices)] = {
-                            'type': 'generic', 'jit_fn': jit_fn,
+                            'type': 'generic_xdep' if _sub_xdep else 'generic', 'jit_fn': jit_fn,
                         }
 
         # ── 4c. All-in-one backward conv + combine + integrate JIT ──
@@ -3145,6 +3359,33 @@ class cluster_number_counts:
                     assert sx.shape == (n_bc, len(self.ln_M)), (
                         f"get_std_x must return (n_bc, n_lnM); got {sx.shape}")
                     all_sigma_x.append(sx)
+                elif self._bc_set_xdep2[len(all_sigma_x)] is not None:
+                    # 2-observable x-dependent set: (n_bc, 2, n_ref). An observable that declares
+                    # x-dependent scatter gets its table; the other one the constant width of
+                    # its layer-0 covariance. The correlation coefficient of the two is that of
+                    # the layer-0 covariance matrix (get_cov), taken as independent of the mass.
+                    _s = len(all_sigma_x); _decl2 = self._bc_set_xdep2[_s]
+                    _cov0 = np.asarray(all_cov_layer0[_s], dtype=np.float64)
+                    _cov1 = np.asarray(all_cov_layer1[_s], dtype=np.float64)
+                    if np.any(_cov1[:, 0, 1] != 0.) or np.any(_cov1[:, 1, 0] != 0.):
+                        raise NotImplementedError(
+                            "mass_dep_scatter=True: a 2-observable correlation set with x-dependent "
+                            "layer-0 scatter requires a diagonal layer-1 covariance "
+                            f"(observables {obs_names})")
+                    _rows = []
+                    for _j, _o in enumerate(obs_names):
+                        if _decl2[_j]:
+                            _sx = np.asarray(self.scatter.get_std_x(
+                                observable1=_o, observable2=_o,
+                                layer=0, lnM=np.asarray(self.ln_M, dtype=np.float64),
+                                other_params={"zc": self._bc_cached['z_np'],
+                                              "h": to_float(self.cosmology.cosmo_params["h"])}), dtype=np.float64)
+                            assert _sx.shape == (n_bc, len(self.ln_M)), (
+                                f"get_std_x must return (n_bc, n_lnM); got {_sx.shape}")
+                        else:
+                            _sx = np.sqrt(_cov0[:, _j, _j])[:, None] * np.ones((1, len(self.ln_M)))
+                        _rows.append(_sx)
+                    all_sigma_x.append(jnp.asarray(np.stack(_rows, axis=1)))
                 else:
                     all_sigma_x.append(jnp.zeros((n_bc, 1), dtype=jnp.float64))
             all_sigma_x = tuple(all_sigma_x)
@@ -3248,6 +3489,32 @@ class cluster_number_counts:
                     x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
                     obs_val_0, inv_cov1, norm1, inv_cov0, norm0,
                     has_scatter, sub_apply_cut, sub_cut_val, sub_mean_cut_val)
+
+            def _dispatch_2d_xdep(fwd_jit, conv_jit, mn, mx, set_obs,
+                                  ez, da, dl, rc, zc,
+                                  sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                  sub_l0_pc, sub_l1_pc,
+                                  sub_cov_l0, sub_cov_l1, sub_sigma_x,
+                                  sub_apply_cut, sub_cut_val, sub_mean_cut_val,
+                                  patch_sub):
+                """2-observable set with x-dependent layer-0 scatter: forward stage, then the
+                factorised second stage. sub_sigma_x: (n_group, 2, n_ref) width tables; the
+                correlation coefficient is that of sub_cov_l0."""
+                (r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                 x_lin_0_start, x_lin_1_start,
+                 dx0_arr, dx1_arr) = fwd_jit(
+                    mn, mx, set_obs, ez, da, dl, rc,
+                    H0_jnp, D_CMB_jnp, gamma_jnp, zc,
+                    sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                    sub_l0_pc, sub_l1_pc,
+                    patch_sub)
+                rho = sub_cov_l0[:, 0, 1] / jnp.sqrt(sub_cov_l0[:, 0, 0] * sub_cov_l0[:, 1, 1])
+                return conv_jit(
+                    mn, mx, r0, r1, kc0, kc1, x_l0_0, x_l0_1,
+                    x_lin_0_start, x_lin_1_start, dx0_arr, dx1_arr,
+                    set_obs[:, 0], sub_cov_l1[:, 0, 0], sub_cov_l1[:, 1, 1], rho,
+                    sub_sigma_x[:, 0, :], sub_sigma_x[:, 1, :], lnM_ref_sx,
+                    sub_apply_cut, sub_cut_val, sub_mean_cut_val)
 
             def _compute_all_set_cpdfs(sl=None):
                 """Compute pre_nd_cpdfs for all sets with pattern-aware dispatch.
@@ -3383,18 +3650,39 @@ class cluster_number_counts:
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val, sub_mean_cut,
                                 patch_sub)
-                        elif jit_info['type'] == 'generic':
+                        elif jit_info['type'] == '2d_xdep':
+                            set_obs = jnp.stack(
+                                [obs_data[sub_obs[j]][0][ci_g_jnp]
+                                 for j in range(2)], axis=1)
+                            zc = z_clusters[ci_g_jnp]
+                            sub_l0_pc = tuple(
+                                tuple(p[ci_g_jnp] for p in all_layer0_sr_pc[i])
+                                for i in obs_idxs)
+                            sub_l1_pc = tuple(
+                                tuple(p[ci_g_jnp] for p in all_layer1_sr_pc[i])
+                                for i in obs_idxs)
+                            cpdf_sub = _dispatch_2d_xdep(
+                                jit_info['fwd_jit'], jit_info['conv_jit'],
+                                mn, mx, set_obs, ez, da, dl, rc, zc,
+                                sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                sub_l0_pc, sub_l1_pc,
+                                sub_cov_l0, sub_cov_l1, all_sigma_x[s_idx][ci_g_jnp],
+                                sub_apply_cut, sub_cut_val, sub_mean_cut,
+                                patch_sub)
+                        elif jit_info['type'] in ('generic', 'generic_xdep'):
                             set_obs = jnp.stack(
                                 [obs_data[sub_obs[j]][0][ci_g_jnp]
                                  for j in range(n_sub)], axis=1)
                             zc = z_clusters[ci_g_jnp]
+                            _extra = ((all_sigma_x[s_idx][ci_g_jnp][:, pattern[0], :], lnM_ref_sx)
+                                      if jit_info['type'] == 'generic_xdep' else ())
                             cpdf_sub = jit_info['jit_fn'](
                                 mn, mx, set_obs, ez, da, dl, rc,
                                 H0_jnp, D_CMB_jnp, gamma_jnp, zc,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val, sub_mean_cut,
-                                patch_sub)
+                                patch_sub, *_extra)
                         else:
                             continue
 
