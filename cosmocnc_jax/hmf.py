@@ -7,6 +7,49 @@ import logging
 
 
 # =====================================================================
+# Optional multiplicative perturbation of the Tinker08 mass function by modes
+# (cnc_params["hmf_calibration_modes_file"]; off by default)
+# =====================================================================
+
+HMF_MODE_AMP_PREFIX = "hmf_mode_amp_"   # amplitude k (k = 1, 2, ...) is scal_rel_params[HMF_MODE_AMP_PREFIX + str(k)]
+HMF_MODES_MAX = 20
+
+
+def load_hmf_calibration_modes(path):
+    """Read a file of modes of a perturbation of the mass function: an .npz with
+      x_grid : (n_x,) strictly increasing values of x = log10(1/sigma),
+      z_grid : (n_z,) strictly increasing redshifts,
+      modes  : (n_x, n_z, n_modes) values of each mode of ln(n_true / n_Tinker) on that grid (1 <= n_modes <= HMF_MODES_MAX).
+    The mass function becomes n * exp(Sum_k a_k mode_k(x, z)) with a_k = scal_rel_params[HMF_MODE_AMP_PREFIX + str(k)]
+    (k from 1). Returns (x_grid, z_grid, modes) as float64 NumPy arrays."""
+    d = np.load(path)
+    for key in ("x_grid", "z_grid", "modes"):
+        if key not in d.files:
+            raise ValueError(f"hmf_calibration_modes_file {path}: missing array {key!r} (needs x_grid, z_grid, modes)")
+    x = np.asarray(d["x_grid"], dtype=np.float64); z = np.asarray(d["z_grid"], dtype=np.float64)
+    modes = np.asarray(d["modes"], dtype=np.float64)
+    if x.ndim != 1 or z.ndim != 1 or len(x) < 2 or len(z) < 2 or np.any(np.diff(x) <= 0) or np.any(np.diff(z) <= 0):
+        raise ValueError(f"hmf_calibration_modes_file {path}: x_grid and z_grid must be 1-D, strictly increasing, of length >= 2")
+    if modes.ndim != 3 or modes.shape[:2] != (len(x), len(z)) or not (1 <= modes.shape[2] <= HMF_MODES_MAX):
+        raise ValueError(f"hmf_calibration_modes_file {path}: modes must have shape (len(x_grid), len(z_grid), n_modes) with "
+                         f"1 <= n_modes <= {HMF_MODES_MAX}; got {modes.shape}")
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(z)) and np.all(np.isfinite(modes))):
+        raise ValueError(f"hmf_calibration_modes_file {path}: non-finite values")
+    return x, z, modes
+
+
+@jax.jit
+def hmf_calibration_ln_factor(sigma_matrix, redshift_vec, x_grid, z_grid, modes, amps):
+    """ln of the multiplicative factor of the mass function on the (n_z, n_M) grid: Sum_k amps[k] mode_k(x, z) with
+    x = log10(1/sigma). Linear interpolation in z (per x node of the table), then in x; outside the table the edge
+    values are used (jnp.interp clamps). Mirrored exactly (same order of interpolation) in cosmocnc's hmf.py."""
+    F = jnp.tensordot(modes, amps, axes=([2], [0]))                              # (n_x, n_z_table)
+    Fz = jax.vmap(lambda row: jnp.interp(redshift_vec, z_grid, row))(F)          # (n_x, n_z)
+    x = jnp.log10(1. / sigma_matrix)                                             # (n_z, n_M)
+    return jax.vmap(lambda xi, col: jnp.interp(xi, x_grid, col), in_axes=(0, 1))(x, Fz)
+
+
+# =====================================================================
 # Tinker08 parameter arrays (module-level constants for JIT)
 # =====================================================================
 

@@ -142,6 +142,9 @@ cnc_params_default = {
     "M_min_cutoff": None,
     "hmf_calc": "cnc", # "cnc" (JAX, required for classy_sz_jax), "hmf", "MiraTitan"
     "hmf_type": "Tinker08", # "Tinker08", "Tinker10", or "Castro23" (Castro23: classy_sz_jax only, virial-mass HMF via the B13 200c->vir conversion)
+    "hmf_calibration_modes_file": None, # optional: path of a file of modes of a multiplicative perturbation of the Tinker08 mass function,
+                                        # n -> n * exp(Sum_k a_k mode_k(log10(1/sigma), z)), amplitudes a_k = scal_rel_params "hmf_mode_amp_<k>"
+                                        # (k from 1); None = off. Only with hmf_calc "cnc" and hmf_type "Tinker08". See hmf.load_hmf_calibration_modes.
     "mass_definition": "500c",
     "hmf_type_deriv": "numerical", #"analytical" or "numerical"
     "fft_mode": "auto", #"exact"(f64 FFT, GPU/CPU)|"tpu"(c64 FFT + FFT-free sigma)|"tpu_direct"(tpu + searchsorted-free abundance interps)|"auto"(by backend)

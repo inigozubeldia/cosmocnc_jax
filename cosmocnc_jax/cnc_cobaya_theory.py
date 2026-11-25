@@ -39,6 +39,7 @@ _CNC_PARAM_KEYS = (
     "cosmology_tool", "camb_accuracy_boost", "camb_pk_var",   # camb_*: cosmology_tool="camb" only (2026-09-04)
     "M_min", "M_max", "M_min_extended", "M_min_cutoff",
     "hmf_calc", "hmf_type", "mass_definition", "hmf_type_deriv", "fft_mode",
+    "hmf_calibration_modes_file",   # optional modes of a perturbation of the Tinker08 mass function; None = off
     "power_spectrum_type", "cosmo_amplitude_parameter", "cosmo_param_density",
     "scalrel_type_deriv", "sigma_scatter_min", "interp_tinker", "Hubble_parameter",
     "cosmo_model", "class_sz_ndim_masses", "class_sz_concentration_parameter",
@@ -113,6 +114,8 @@ _SR_INPUT_PARAMS = (
     # CMB-lensing bias nuisances
     "a_beta_generic", "alpha_beta_generic", "beta_beta_generic",
     "cmblensing_bias_simple",
+    # amplitudes of the optional mass-function modes (cnc_params["hmf_calibration_modes_file"])
+) + tuple(f"hmf_mode_amp_{_k}" for _k in range(1, 21)) + (
     # Planck MMF legacy
     "alpha", "log10_Y_star", "bias_cmblens", "sigma_lnq", "sigma_lnp",
     "corr_lnq_lnp", "a_lens",
@@ -141,6 +144,18 @@ _WL_PCA_SCORES = ("b_wl_pc1", "b_wl_pc2", "b_wl_pc3", "b_wl_pc4", "b_wl_pc5",
                   "s_wl_pc1", "s_wl_pc2", "s_wl_pc3", "s_wl_pc4", "s_wl_pc5")
 
 
+def check_hmf_mode_param_set(n_modes, input_params):
+    """Raise if the run's mass-function mode amplitudes do not match the modes file: with a file of n modes, the n
+    amplitudes hmf_mode_amp_1..n must all be in the run (an absent one would stay at 0, silently); amplitudes beyond n,
+    or any amplitude without a file, would be sampled against their prior with no effect."""
+    names = [p for p in input_params if p.startswith("hmf_mode_amp_")]
+    need = {f"hmf_mode_amp_{k}" for k in range(1, n_modes + 1)}
+    missing = sorted(need - set(names)); extra = sorted(set(names) - need)
+    if missing or extra:
+        raise ValueError(f"hmf_calibration_modes_file gives {n_modes} mass-function modes, but the run config's amplitudes do "
+                         f"not match: missing {missing}, without effect {extra}.")
+
+
 def check_wl_calibration_param_set(cnc_params, input_params):
     """Raise if the run's WL parameters include ones the selected WL calibration model ignores."""
     model = (cnc_params.get("catalogue_params") or {}).get("wl_calibration_model", "zbin")
@@ -162,6 +177,8 @@ class cnc(classy):
     # to route from the sampler into scal_rel_params (for survey files whose parameters
     # are not in the built-in list). Each is passed through unchanged if present in the run.
     extra_scal_rel_params : Optional[list] = None
+    # optional modes of a multiplicative perturbation of the Tinker08 mass function (see cosmocnc_jax.hmf); None = off
+    hmf_calibration_modes_file : Optional[str] = None
     number_cores_hmf : Optional[str] = 8
     number_cores_abundance : Optional[str] = 8
     number_cores_data : Optional[str] = 8
@@ -485,6 +502,8 @@ class cnc(classy):
         super().initialize_with_params()
         # the run's WL parameter set must match the survey file's WL calibration model
         check_wl_calibration_param_set(self.cnc.cnc_params, list(self.input_params))
+        # the run's mass-function mode amplitudes must match the modes file (none without a file)
+        check_hmf_mode_param_set(len(getattr(self.cnc, "_hmf_mode_names", ())), list(self.input_params))
 
     def get_can_support_params(self):
         # THE ROUTING FIX (2026-07-08). Advertise every parameter calculate()
@@ -597,6 +616,10 @@ class cnc(classy):
         assign_parameter_value(scal_rel_params,params_values,"alpha_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"beta_beta_generic")
         assign_parameter_value(scal_rel_params,params_values,"cmblensing_bias_simple")
+
+        # amplitudes of the optional mass-function modes
+        for _k in range(1, 21):
+            assign_parameter_value(scal_rel_params,params_values,f"hmf_mode_amp_{_k}")
 
         # additional scaling-relation parameters named by the run configuration
         for _extra in (self.extra_scal_rel_params or []):

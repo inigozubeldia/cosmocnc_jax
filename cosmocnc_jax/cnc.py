@@ -1377,6 +1377,21 @@ class cluster_number_counts:
         set_verbosity(self.cnc_params["cosmocnc_verbose"])
         self.logger = logging.getLogger(__name__)
 
+        # Optional modes of a multiplicative perturbation of the mass function (off unless a file is given).
+        # Gated: only for the internal Tinker08 calculation, whose sigma(M, z) the modes are defined against.
+        self._hmf_modes = None
+        self._hmf_mode_names = ()
+        _modes_path = self.cnc_params.get("hmf_calibration_modes_file", None)
+        if _modes_path is not None:
+            if self.cnc_params["hmf_calc"] != "cnc" or self.cnc_params["hmf_type"] != "Tinker08":
+                raise ValueError("hmf_calibration_modes_file is only supported with hmf_calc = 'cnc' and hmf_type = 'Tinker08' "
+                                 f"(got hmf_calc = {self.cnc_params['hmf_calc']!r}, hmf_type = {self.cnc_params['hmf_type']!r})")
+            _x, _z, _m = load_hmf_calibration_modes(_modes_path)
+            self._hmf_modes = (jnp.asarray(_x), jnp.asarray(_z), jnp.asarray(_m))
+            self._hmf_mode_names = tuple(f"{HMF_MODE_AMP_PREFIX}{k + 1}" for k in range(_m.shape[2]))
+            self.logger.info(f"mass-function modes: {_m.shape[2]} modes from {_modes_path} on x = log10(1/sigma) "
+                             f"[{_x[0]:.3f}, {_x[-1]:.3f}], z [{_z[0]:.3f}, {_z[-1]:.3f}]; amplitudes {self._hmf_mode_names[0]} ...")
+
         # Resolve the FFT path once. "exact" (default) keeps the GPU/CPU f64 FFT
         # + mcfit FFTLog unchanged. "tpu" selects the TPU-compatible path
         # (complex64 convolutions + FFT-free direct-quadrature sigma(R)), since
@@ -2548,6 +2563,15 @@ class cluster_number_counts:
                         M_vec, rho_m, self.redshift_vec, Delta_vec, volume_element_vec,
                         tinker_Delta, TINKER08_A, TINKER08_a, TINKER08_b, TINKER08_c,
                         M_min_cutoff, interp_log)
+
+                    # Optional multiplicative perturbation by modes (cnc_params["hmf_calibration_modes_file"];
+                    # off by default): n -> n * exp(Sum_k a_k mode_k(log10(1/sigma), z)). Applied here, to the matrix
+                    # every later stage reads (abundance, backward convolutions, stacked term, mass estimates).
+                    if getattr(self, "_hmf_modes", None) is not None:
+                        _amps = jnp.stack([jnp.asarray(self.scal_rel_params.get(_n, 0.), dtype=jnp.float64)
+                                           for _n in self._hmf_mode_names])
+                        self.hmf_matrix = self.hmf_matrix * jnp.exp(hmf_calibration_ln_factor(
+                            sigma_matrix, self.redshift_vec, *self._hmf_modes, _amps))
 
                 elif self.cnc_params["hmf_type"] == "Tinker10":
 
