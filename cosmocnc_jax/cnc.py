@@ -2654,7 +2654,19 @@ class cluster_number_counts:
 
         elif self.cnc_params["hmf_calc"] == "MiraTitan":
 
-            self.ln_M,self.hmf_matrix = self.halo_mass_function.eval_hmf(np.asarray(self.redshift_vec),log=True,volume_element=volume_element)
+            if volume_element and self.cnc_params["cosmology_tool"] in ("classy_sz_jax", "camb"):
+
+                # Volume element dV/dz/dOmega = c chi^2 / H(z) [Mpc^3] in one vectorised step from the D_A and E_z
+                # computed above (the quantity of the Tinker08 fast path, chi^2 / H_over_c), instead of one
+                # background call per redshift inside eval_hmf.
+                self.ln_M,self.hmf_matrix = self.halo_mass_function.eval_hmf(np.asarray(self.redshift_vec),log=True,volume_element=False)
+                _chi = self.D_A*(1.+self.redshift_vec)
+                _vol = _chi**2*(self.const.c_light/1e3)/(100.*self.cosmology.cosmo_params["h"]*self.E_z)
+                self.hmf_matrix = self.hmf_matrix*_vol[:,None]
+
+            else:
+
+                self.ln_M,self.hmf_matrix = self.halo_mass_function.eval_hmf(np.asarray(self.redshift_vec),log=True,volume_element=volume_element)
 
         t1 = time.time()
 
