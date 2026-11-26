@@ -565,7 +565,9 @@ class halo_mass_function:
 
                 MT_emulator = self.extra_params["emulator"]
 
-                M_vec = np.linspace(M_min,M_max,n_points)
+                # same grid, uniform in ln M, as the other branches with log=True (the rest of the likelihood assumes a
+                # uniform ln M grid; this branch used to build a grid linear in M here)
+                M_vec = np.exp(np.linspace(np.log(M_min),np.log(M_max),n_points))
 
                 cosmology_emulator = {
                 "h": self.h,
@@ -578,7 +580,7 @@ class halo_mass_function:
                 "w_a": 0.
                 }
 
-                hmf = jnp.asarray(np.array(MT_emulator.predict(cosmology_emulator,redshift,M_vec*self.h))[0,:,:]*self.h**3)
+                hmf = jnp.asarray(np.array(MT_emulator.predict(cosmology_emulator,redshift,M_vec*self.h,get_errors=False))[0,:,:]*self.h**3)
                 M_eval = jnp.log(M_vec/1e14)
 
                 if volume_element == True:
