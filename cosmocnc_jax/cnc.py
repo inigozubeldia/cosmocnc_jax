@@ -4102,6 +4102,15 @@ class cluster_number_counts:
             self.stacked_cluster_indices[stacked_data_label] = np.asarray(
                 stacked_cluster_indices)
             self.stacked_cluster_z[stacked_data_label] = np.asarray(z_st)
+            # Per-cluster full covariance across the observable's components, only when
+            # the full covariance is requested (stacked_full_cov); lets diagnostics form
+            # the covariance of the stack of any subset of the clusters.
+            if not hasattr(self, "stacked_per_cluster_covariance"):
+                self.stacked_per_cluster_covariance = {}
+            if compute_full_cov:
+                self.stacked_per_cluster_covariance[stacked_data_label] = obs_covs
+            else:
+                self.stacked_per_cluster_covariance.pop(stacked_data_label, None)
 
             # Aggregate
             stacked_model_vec = jnp.sum(obs_means, axis=0) / n_clusters
